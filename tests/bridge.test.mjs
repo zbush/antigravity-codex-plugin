@@ -202,7 +202,10 @@ test("depth, repeated hops, and child environment propagation", (t) => {
   const child = buildChildBridgeEnv(reverse, evaluation, { ...base, PRESERVED: "yes" });
   assert.deepEqual(child.nextChain, [reverse, forward, reverse]);
   assert.equal(child.nextDepth, 3);
-  assert.deepEqual(readDelegationContext(child.env), { depth: 3, chain: child.nextChain });
+  const parsed = readDelegationContext(child.env);
+  assert.equal(parsed.depth, 3);
+  assert.deepEqual(parsed.chain, child.nextChain);
+  assert.equal(parsed.envelope.remaining_hops, evaluation.config.max_depth - 3);
   assert.deepEqual(JSON.parse(child.env.AGENT_BRIDGE_INHERITED_POLICY), evaluation.config);
   assert.deepEqual([child.env.AGENT_BRIDGE_CONFIG, child.env.PRESERVED, base.AGENT_BRIDGE_DEPTH], [file, "yes", "2"]);
 });
@@ -219,6 +222,24 @@ test("nested servers honor revocation and cannot gain authority from a looser po
   assert.equal(after.config.max_depth, 2);
   assert.equal(after.config.allow_cycles, false);
   assert.equal(evaluateDelegationPolicy(reverse, { ...child, AGENT_BRIDGE_INHERITED_POLICY: "{}" }).reason, "invalid_config");
+});
+
+test("a foreign handoff spends the shared budget and keeps this pair's first-return rule", t => {
+  const { env } = fixture(t);
+  const incoming = { version: 1, hops: [{ from: "claude", to: "antigravity", id: "receipt" }], remaining_hops: 2 };
+  const foreign = { ...env, AGENT_BRIDGE_CONTEXT: JSON.stringify(incoming) };
+  const first = evaluateDelegationPolicy(forward, foreign);
+  assert.equal(first.allowed, true);
+  const child = buildChildBridgeEnv(forward, first, foreign).env;
+  const second = evaluateDelegationPolicy(reverse, child);
+  assert.equal(second.allowed, true);
+  const leaf = buildChildBridgeEnv(reverse, second, child).env;
+  const outgoing = JSON.parse(leaf.AGENT_BRIDGE_CONTEXT);
+  assert.deepEqual(outgoing.hops[0], incoming.hops[0]);
+  assert.equal(outgoing.remaining_hops, 0);
+  assert.equal(evaluateDelegationPolicy(forward, leaf).reason, "max_depth_reached");
+  assert.equal(evaluateDelegationPolicy(reverse, foreign).reason, "invalid_context");
+  assert.equal(evaluateDelegationPolicy(forward, { ...foreign, AGENT_BRIDGE_CONTEXT: "{}" }).reason, "invalid_context");
 });
 
 for (const [name, direction, incoming] of [["codex", forward, reverse], ["antigravity", reverse, forward]]) {

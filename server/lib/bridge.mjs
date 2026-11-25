@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { nextContext, readContext } from "./context.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = path.resolve(__dirname, "..", "..");
@@ -15,6 +16,7 @@ export const DIRECTIONS = Object.freeze({
 export const VALID_DIRECTIONS = new Set(Object.values(DIRECTIONS));
 
 export const BRIDGE_ENV_VARS = Object.freeze([
+  "AGENT_BRIDGE_CONTEXT",
   "AGENT_BRIDGE_DEPTH",
   "AGENT_BRIDGE_MAX_DEPTH",
   "AGENT_BRIDGE_CHAIN",
@@ -220,9 +222,17 @@ export function loadBridgeConfig(env = process.env, defaultUserPath = getDefault
 /**
  * Parse and validate incoming delegation context from process environment.
  */
-export function readDelegationContext(env = process.env) {
+export function readDelegationContext(env = process.env, recipient) {
   const rawDepth = env.AGENT_BRIDGE_DEPTH;
   const rawChain = env.AGENT_BRIDGE_CHAIN;
+  const envelope = readContext(env.AGENT_BRIDGE_CONTEXT, recipient);
+  if (envelope) {
+    const depth = envelope.hops.length;
+    if (rawDepth !== undefined && String(depth) !== rawDepth) {
+      throw new Error("AGENT_BRIDGE_DEPTH disagrees with AGENT_BRIDGE_CONTEXT.");
+    }
+    return { depth, chain: envelope.hops.map(hop => hop.from + "_to_" + hop.to), envelope };
+  }
   const hasDepth = rawDepth !== undefined && rawDepth !== "";
   const hasChain = rawChain !== undefined && rawChain !== "";
 
@@ -304,7 +314,7 @@ export function evaluateDelegationPolicy(direction, env = process.env) {
 
   let context;
   try {
-    context = readDelegationContext(env);
+    context = readDelegationContext(env, direction.split("_to_")[0]);
   } catch (err) {
     return {
       allowed: false,
@@ -316,18 +326,20 @@ export function evaluateDelegationPolicy(direction, env = process.env) {
     };
   }
 
-  if (context.depth > 0 && env.AGENT_BRIDGE_INHERITED_POLICY === undefined) {
+  // A foreign bridge entering this pair for the first time has no local ceiling yet.
+  if (context.depth > 0 && env.AGENT_BRIDGE_INHERITED_POLICY === undefined &&
+      (!context.envelope || context.chain.some(hop => VALID_DIRECTIONS.has(hop)))) {
     return {
       allowed: false, directionEnabled: true, reason: "invalid_config", config, context,
       message: "Nested delegation requires AGENT_BRIDGE_INHERITED_POLICY. Run node scripts/configure.mjs --wire-codex, then restart the host.",
     };
   }
-  if (context.depth >= config.max_depth) {
+  if (context.depth >= config.max_depth || context.envelope?.remaining_hops === 0) {
     return {
       allowed: false,
       directionEnabled: true,
       reason: "max_depth_reached",
-      message: `Delegation depth limit reached (${context.depth}/${config.max_depth}, chain: [${context.chain.join(" -> ")}]).`,
+      message: `Delegation hop budget exhausted (depth ${context.depth}, local maximum ${config.max_depth}).`,
       config,
       context,
     };
@@ -361,9 +373,20 @@ export function evaluateDelegationPolicy(direction, env = process.env) {
 export function buildChildBridgeEnv(direction, evaluation, baseEnv = process.env) {
   const nextDepth = evaluation.context.depth + 1;
   const nextChain = [...evaluation.context.chain, direction];
+  const available = evaluation.config.max_depth - evaluation.context.depth;
+  const [from, to] = direction.split("_to_");
+  const prior = evaluation.context.envelope ?? {
+    version: 1, remaining_hops: available,
+    hops: evaluation.context.chain.map((edge, index) => {
+      const [from, to] = edge.split("_to_");
+      return { from, to, id: "legacy-" + index };
+    }),
+  };
+  const envelope = nextContext(prior, from, to, available);
 
   const childEnv = {
     ...baseEnv,
+    AGENT_BRIDGE_CONTEXT: JSON.stringify(envelope),
     AGENT_BRIDGE_DEPTH: String(nextDepth),
     AGENT_BRIDGE_CHAIN: JSON.stringify(nextChain),
     AGENT_BRIDGE_INHERITED_POLICY: JSON.stringify(evaluation.config),

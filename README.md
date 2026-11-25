@@ -105,6 +105,7 @@ env_vars = [
   "AGENT_BRIDGE_MAX_DEPTH",
   "AGENT_BRIDGE_CHAIN",
   "AGENT_BRIDGE_CONFIG",
+  "AGENT_BRIDGE_CONTEXT",
   "AGENT_BRIDGE_INHERITED_POLICY",
   "AGENT_BRIDGE_ANTIGRAVITY_TO_CODEX",
   "AGENT_BRIDGE_CODEX_TO_ANTIGRAVITY",
@@ -185,6 +186,8 @@ node scripts/configure.mjs --mode bidirectional --max-depth 4 --allow-cycles on
 3. **Fail-closed validation.** A nonzero `AGENT_BRIDGE_DEPTH` without `AGENT_BRIDGE_INHERITED_POLICY` refuses the launch. The bridge also fails closed on malformed JSON, invalid policy values, blank or relative `AGENT_BRIDGE_CONFIG` paths, missing explicit `AGENT_BRIDGE_CONFIG` files at runtime, and inconsistent `AGENT_BRIDGE_DEPTH` and `AGENT_BRIDGE_CHAIN` values.
 
 ### Environment variable overrides
+
+Updated bridges pass `AGENT_BRIDGE_CONTEXT` through the host environment. Its version 1 JSON object contains ordered `hops` with `from`, `to` and a unique `id`, plus `remaining_hops`. Each handoff spends one hop and applies the smaller of the incoming budget and the local limit. A handoff entering from the Claude bridge can start this pair's local policy history. A returning handoff that previously used this pair must still carry its inherited policy. Refresh existing Codex forwarding with `node scripts/configure.mjs --wire-codex`.
 
 | Variable | Values | Purpose |
 | :--- | :--- | :--- |
