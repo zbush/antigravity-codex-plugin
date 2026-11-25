@@ -5,13 +5,13 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import { pathToFileURL } from "node:url";
-import { buildChildBridgeEnv, DIRECTIONS, evaluateDelegationPolicy } from "./lib/bridge.mjs";
-import { createRpcError, startMcpStdioServer } from "./lib/mcp.mjs";
+import { buildChildBridgeEnv, delegationPrompt, DIRECTIONS, evaluateDelegationPolicy } from "./lib/bridge.mjs";
+import { createRpcError, startMcpStdioServer, validateToolArguments } from "./lib/mcp.mjs";
+import { bridgeStatus } from "./lib/status.mjs";
 import { loadWorkspacePolicy, resolveWorkspaceDir } from "./lib/workspace-policy.mjs";
 import {
-  configuredFile, createJobRegistry, DEFAULT_TIMEOUT_SECONDS, findWindowsCommand, MAX_RECENT_EVENTS,
-  MAX_STDERR_CHARS, MAX_TIMEOUT_SECONDS, terminateProcessTree,
-  windowsBatchInvocation,
+  cliInvocation, configuredFile, createJobRegistry, DEFAULT_TIMEOUT_SECONDS, findWindowsCommand, MAX_RECENT_EVENTS,
+  isClosedStdinError, MAX_STDERR_CHARS, MAX_TIMEOUT_SECONDS, terminateProcessTree,
 } from "./lib/process.mjs";
 
 const direction = DIRECTIONS.CODEX_TO_ANTIGRAVITY;
@@ -25,19 +25,18 @@ export function resolveAgyInvocation(agyArgs, env = process.env) {
     path.join(env.HOME || os.homedir(), ".local", "bin", "agy"),
     "/opt/homebrew/bin/agy", "/usr/local/bin/agy",
   ];
-  const found = configuredFile(env.AGY_BIN, "AGY_BIN") || defaults.find(
+  const configured = configuredFile(env.AGY_BIN, "AGY_BIN");
+  if (configured) return cliInvocation(configured, agyArgs, "AGY_BIN");
+  const found = defaults.find(
     (file) => file && path.isAbsolute(file) && fs.statSync(file, { throwIfNoEntry: false })?.isFile()
   );
   const command = found ? path.resolve(found) : windows ? findWindowsCommand("agy", env) : "agy";
-  if (windows && /\.(cmd|bat)$/i.test(command)) return windowsBatchInvocation(command, agyArgs);
-  if (/\.[cm]?js$/i.test(command)) {
-    return { command: process.execPath, args: [command, ...agyArgs], shell: false };
-  }
-  return { command, args: agyArgs, shell: false };
+  return cliInvocation(command, agyArgs, found ? "platform installation" : "PATH");
 }
 
 const launchSchema = {
   type: "object",
+  additionalProperties: false,
   required: ["prompt", "cwd"],
   properties: {
     prompt: { type: "string", description: "Task instructions for Antigravity." },
@@ -52,7 +51,7 @@ const launchSchema = {
     timeout_seconds: { type: "integer", minimum: 1, maximum: MAX_TIMEOUT_SECONDS, default: DEFAULT_TIMEOUT_SECONDS },
   },
 };
-const jobSchema = { type: "object", properties: { job_id: { type: "string" } } };
+const jobSchema = { type: "object", additionalProperties: false, properties: { job_id: { type: "string" } } };
 const launchTools = [
   { name: "antigravity_run", description: "Run a local Antigravity task and return its response and conversation ID.", inputSchema: launchSchema },
   { name: "antigravity_spawn", description: "Start a background Antigravity task and return its job ID.", inputSchema: launchSchema },
@@ -60,6 +59,8 @@ const launchTools = [
 const jobTools = [
   { name: "antigravity_job_status", description: "Inspect a job, or list tracked jobs when job_id is omitted.", inputSchema: jobSchema },
   { name: "antigravity_job_cancel", description: "Cancel a running Antigravity job and its child processes.", inputSchema: { ...jobSchema, required: ["job_id"] } },
+  { name: "antigravity_status", description: "Inspect the Antigravity CLI, workspace, delegation policy and job capacity.",
+    annotations: { readOnlyHint: true }, inputSchema: { type: "object", additionalProperties: false, properties: {} } },
 ];
 
 function buildArgs(params, seconds, policy) {
@@ -69,7 +70,6 @@ function buildArgs(params, seconds, policy) {
     throw new Error("timeout_seconds must be an integer between 1 and " + MAX_TIMEOUT_SECONDS + ".");
   }
   if (!policy.allowEdits) throw new Error("Antigravity requires AGENT_BRIDGE_ALLOW_EDITS=true because its CLI can edit the workspace.");
-  if (params.agent !== undefined || params.resume !== undefined) throw new Error("Custom agents and saved Antigravity conversations cannot be scoped to this launch.");
   const mode = params.mode ?? "plan";
   if (!["plan", "accept-edits"].includes(mode)) throw new Error("Choose plan or accept-edits.");
   for (const key of ["model", "effort"]) {
@@ -122,7 +122,7 @@ function recordEvent(job, line) {
   if (job.recent_events.length > MAX_RECENT_EVENTS) job.recent_events.shift();
 }
 
-function launch(registry, params, evaluation) {
+function launch(registry, params, evaluation, signal) {
   const seconds = params.timeout_seconds === undefined ? DEFAULT_TIMEOUT_SECONDS : params.timeout_seconds;
   let cwd, args;
   try {
@@ -136,21 +136,20 @@ function launch(registry, params, evaluation) {
   }
   const { env, nextDepth, nextChain } = buildChildBridgeEnv(direction, evaluation);
   env.AGENT_BRIDGE_WORKSPACE_ROOTS = JSON.stringify([cwd, ...params.add_dirs]);
+  if ((params.mode ?? "plan") === "plan") env.AGENT_BRIDGE_ALLOW_EDITS = "false";
   const invocation = resolveAgyInvocation(args, env);
   const child = spawn(invocation.command, invocation.args, {
-    cwd, env, shell: false, windowsVerbatimArguments: invocation.windowsVerbatimArguments,
+    cwd, env, shell: false,
     stdio: "pipe", windowsHide: true, detached: process.platform !== "win32",
   });
   const job = {
     job_id: randomUUID(), status: "running", pid: child.pid ?? null, cwd,
     started_at: new Date().toISOString(), completed_at: null, exit_code: null, signal: null,
     delegation_depth: nextDepth, delegation_chain: nextChain,
-    conversation_id: params.resume?.conversation_id ?? null,
+    conversation_id: null,
     response: "", result_status: null, structured_output: null, usage: null,
     recent_events: [], errors: [], stderr: "",
   };
-  registry.jobs.set(job.job_id, job);
-  registry.activeChildren.add(child);
 
   const lines = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
   lines.on("line", (line) => recordEvent(job, line));
@@ -158,17 +157,19 @@ function launch(registry, params, evaluation) {
     job.stderr += chunk.slice(0, MAX_STDERR_CHARS - job.stderr.length);
   });
   let stopping, forceTimer, drainTimer;
-  function stop(status, reason) {
+  function stop(status, reason, force = false) {
     if (stopping || job.status !== "running") return false;
     stopping = status;
     job.errors.push(reason);
-    terminateProcessTree(child);
-    forceTimer = setTimeout(() => terminateProcessTree(child, true), 3000);
+    terminateProcessTree(child, force);
+    forceTimer = setTimeout(() => terminateProcessTree(child, true), 3000).unref();
     return true;
   }
   job.cancel = (reason = "Cancelled by caller.") => stop("cancelled", reason);
-  const watchdog = setTimeout(() => stop("timed_out", "Timed out after " + seconds + "s."), seconds * 1000);
-  child.stdin.on("error", (err) => job.errors.push(err.message));
+  const abort = () => stop("cancelled", "MCP request cancelled.", true);
+  signal?.addEventListener("abort", abort, { once: true });
+  const watchdog = setTimeout(() => stop("timed_out", "Timed out after " + seconds + "s."), seconds * 1000).unref();
+  child.stdin.on("error", err => { if (!isClosedStdinError(err)) job.errors.push(err.message); });
   child.on("error", (err) => job.errors.push(err.message));
   child.once("exit", () => {
     // A descendant can hold inherited pipes open after the CLI exits.
@@ -176,17 +177,16 @@ function launch(registry, params, evaluation) {
       terminateProcessTree(child, true);
       child.stdout.destroy();
       child.stderr.destroy();
-    }, 500);
+    }, 500).unref();
   });
-  const done = new Promise((resolve) => child.once("close", (code, signal) => {
+  const done = new Promise((resolve) => child.once("close", (code, exitSignal) => {
     clearTimeout(watchdog);
     clearTimeout(forceTimer);
     clearTimeout(drainTimer);
     if (stopping && process.platform !== "win32") terminateProcessTree(child, true);
-    registry.activeChildren.delete(child);
-    delete job.cancel;
+    signal?.removeEventListener("abort", abort);
     job.exit_code = code;
-    job.signal = signal;
+    job.signal = exitSignal;
     job.completed_at = new Date().toISOString();
     if (stopping) job.status = stopping;
     else if (job.finished_reason === "print_timeout") job.status = "timed_out";
@@ -197,9 +197,12 @@ function launch(registry, params, evaluation) {
         ? "Antigravity result " + job.result_status + ", exit code " + code + "."
         : "Antigravity exited without a terminal result.");
     }
+    registry.finish(job, child);
     resolve(job);
   }));
-  child.stdin.end(JSON.stringify({ event: "user", message: { content: params.prompt } }) + "\n");
+  const content = delegationPrompt("Codex", "Google Antigravity", params.prompt);
+  child.stdin.end(JSON.stringify({ event: "user", message: { content } }) + "\n");
+  registry.track(job, child);
   return { job, done };
 }
 
@@ -213,20 +216,20 @@ function summary(job) {
 }
 
 export function startAntigravityMcpServer() {
-  const registry = createJobRegistry();
+  const registry = createJobRegistry(() => server.notifyToolsListChangedIfNeeded(getTools()));
   function policy() {
-    const evaluation = evaluateDelegationPolicy(direction);
+    const evaluation = evaluateDelegationPolicy(direction, process.env, registry.activeChildren.size);
     if (!evaluation.directionEnabled) registry.cancelAll("Direction disabled by user policy.");
     return evaluation;
   }
-  return startMcpStdioServer({
-    serverName: "antigravity-local", serverVersion: "2.0.0",
-    getTools() {
-      const evaluation = policy();
-      if (!evaluation.directionEnabled) return [];
-      return evaluation.allowed ? [...launchTools, ...jobTools] : jobTools;
-    },
-    async callTool(name, args) {
+  function getTools() {
+    const evaluation = policy();
+    if (!evaluation.directionEnabled) return [];
+    return evaluation.allowed ? [...launchTools, ...jobTools] : jobTools;
+  }
+  const server = startMcpStdioServer({
+    serverName: "antigravity-local", serverVersion: "2.1.0", getTools,
+    async callTool(name, args, signal) {
       const evaluation = policy();
       const launching = launchTools.some((tool) => tool.name === name);
       if (!evaluation.directionEnabled || (launching && !evaluation.allowed)) {
@@ -235,16 +238,19 @@ export function startAntigravityMcpServer() {
           max_depth: evaluation.config?.max_depth ?? null,
         });
       }
+      const tool = [...launchTools, ...jobTools].find(tool => tool.name === name);
+      if (!tool) throw createRpcError(-32601, "Unknown tool: " + name);
+      validateToolArguments(tool, args);
       if (launching) {
-        const { job, done } = launch(registry, args, evaluation);
+        const { job, done } = launch(registry, args, evaluation, name === "antigravity_run" ? signal : undefined);
         if (name === "antigravity_spawn") return reply(summary(job));
         await done;
         return reply(job, job.status !== "completed");
       }
+      if (name === "antigravity_status") return bridgeStatus(resolveAgyInvocation, evaluation, registry, signal);
       if (name === "antigravity_job_status" && args.job_id === undefined) {
         return reply({ jobs: Array.from(registry.jobs.values(), summary) });
       }
-      if (!jobTools.some((tool) => tool.name === name)) throw createRpcError(-32601, "Unknown tool: " + name);
       const job = registry.jobs.get(args.job_id);
       if (!job) return { content: [{ type: "text", text: "Unknown job_id: " + args.job_id }], isError: true };
       if (name === "antigravity_job_cancel") {
@@ -254,6 +260,7 @@ export function startAntigravityMcpServer() {
     },
     onShutdown: () => registry.cancelAll("MCP server shutting down."),
   });
+  return server;
 }
 
 if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) startAntigravityMcpServer();

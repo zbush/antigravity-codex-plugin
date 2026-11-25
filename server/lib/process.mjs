@@ -1,7 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import { isFullyAbsolute } from "./workspace-policy.mjs";
 
 export const DEFAULT_TIMEOUT_SECONDS = 600;
 export const MAX_TIMEOUT_SECONDS = 1800;
@@ -15,66 +15,41 @@ function windowsSystemTool(name) {
 }
 
 export function findWindowsCommand(name, env) {
-  const dirs = (env.PATH || env.Path || "").split(path.delimiter)
-    .map(dir => dir.replace(/^"|"$/g, "")).filter(dir => path.isAbsolute(dir));
-  for (const suffix of [".exe", ".cmd", ".bat"]) {
-    for (const dir of dirs) {
-      const file = path.join(dir, name + suffix);
+  const dirs = (env.PATH ?? env.Path ?? "").split(path.delimiter)
+    .map(dir => dir.replace(/^"|"$/g, "")).filter(isFullyAbsolute);
+  const candidates = [name + ".exe"];
+  if (name === "codex") candidates.push(path.join("node_modules", "@openai", "codex", "bin", "codex.js"));
+  for (const dir of dirs) {
+    for (const candidate of candidates) {
+      const file = path.join(dir, candidate);
       if (fs.statSync(file, { throwIfNoEntry: false })?.isFile()) return file;
     }
   }
-  throw new Error("Cannot find " + name + " on PATH. Configure its absolute executable path.");
+  throw new Error("Cannot find " + name + " on PATH. Configure its absolute executable path (.exe or JavaScript entry point).");
 }
 
 export function configuredFile(file, variable) {
   if (!file) return undefined;
-  if (!path.isAbsolute(file) || !fs.statSync(file, { throwIfNoEntry: false })?.isFile()) {
+  if (process.platform === "win32" && /\.(cmd|bat)$/i.test(file)) {
+    const guidance = variable === "CODEX_BIN" ? "a .exe or CODEX_CLI_JS for a JavaScript entry point" : "a .exe or JavaScript entry point";
+    throw new Error(variable + " does not support batch files. Use " + guidance + ".");
+  }
+  if (!isFullyAbsolute(file) || !fs.statSync(file, { throwIfNoEntry: false })?.isFile()) {
     throw new Error(variable + " must point to an existing absolute file.");
   }
   return file;
 }
 
-// Quote for the program's argv parser, then protect cmd metacharacters on
-// both passes (cmd /c and the batch shim's %* forwarding).
-export function windowsBatchInvocation(command, args) {
-  const escapeMeta = (s) => s.replace(/[()%!^"<>&| \t]/g, "^$&");
-  const quotedArgs = args.map((arg) => {
-    if (/[\r\n\0]/.test(arg)) throw new Error("Batch arguments must be single-line strings.");
-    const quoted = '"' + arg.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/, "$1$1") + '"';
-    return escapeMeta(escapeMeta(quoted));
-  });
-  const line = [escapeMeta(command), ...quotedArgs].join(" ");
-  return {
-    command: windowsSystemTool("cmd.exe"),
-    args: ["/d", "/s", "/c", '"' + line + '"'],
-    windowsVerbatimArguments: true,
-    shell: false,
-  };
+export function cliInvocation(file, args, source) {
+  if (/\.[cm]?js$/i.test(file) || source === "CODEX_CLI_JS") {
+    return { command: process.execPath, args: [file, ...args], shell: false, binary: file, source };
+  }
+  return { command: file, args, shell: false, binary: file, source };
 }
 
-export function expandHome(inputPath) {
-  if (typeof inputPath !== "string") return inputPath;
-  const trimmed = inputPath.trim();
-  if (trimmed === "~") return os.homedir();
-  if (trimmed.startsWith("~/") || trimmed.startsWith("~\\")) {
-    return path.join(os.homedir(), trimmed.slice(2));
-  }
-  return trimmed;
-}
-
-export function validateAbsoluteDir(dirPath, fieldName = "cwd") {
-  if (typeof dirPath !== "string" || !dirPath.trim()) {
-    throw new Error(`'${fieldName}' must be a non-empty absolute directory path.`);
-  }
-  const expanded = expandHome(dirPath);
-  if (!path.isAbsolute(expanded)) {
-    throw new Error(`'${fieldName}' must be an absolute directory path: "${dirPath}"`);
-  }
-  const resolved = path.resolve(expanded);
-  if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
-    throw new Error(`Directory does not exist (${fieldName}): ${resolved}`);
-  }
-  return resolved;
+export function isClosedStdinError(error) {
+  // libuv can report a closed child stdin pipe as "write EOF" on Windows.
+  return error.code === "EPIPE" || (process.platform === "win32" && error.code === "EOF" && error.syscall === "write");
 }
 
 export function clampTimeoutMs(timeoutSeconds) {
@@ -136,9 +111,37 @@ export function terminateProcessTree(child, force = false) {
 /**
  * Track and manage spawned child jobs cleanly across servers.
  */
-export function createJobRegistry() {
+export function createJobRegistry(onActiveChange) {
   const jobs = new Map();
   const activeChildren = new Set();
+  const recentFinished = [];
+
+  const track = (job, child) => {
+    jobs.set(job.job_id, job);
+    activeChildren.add(child);
+    onActiveChange?.();
+  };
+
+  const finish = (job, child) => {
+    activeChildren.delete(child);
+    delete job.cancel;
+    delete job.cleanup;
+    onActiveChange?.();
+    recentFinished.push(job.job_id);
+    if (recentFinished.length <= 50) return;
+    const id = recentFinished.shift();
+    const old = jobs.get(id);
+    // Retain identity, terminal status and launch scope for inspection and session reuse.
+    const compact = { ...old, output_pruned: true, response: "", stderr: "", recent_events: [], errors: [], usage: null };
+    if (old.commands) {
+      compact.commands_run = old.commands.length;
+      compact.file_changes_count = old.file_changes.length;
+      compact.commands = [];
+      compact.file_changes = [];
+    }
+    if ("structured_output" in old) compact.structured_output = null;
+    jobs.set(id, compact);
+  };
 
   const cancelAll = (reason = "Server shutting down or direction disabled.") => {
     for (const job of jobs.values()) {
@@ -149,12 +152,14 @@ export function createJobRegistry() {
     for (const child of activeChildren) {
       terminateProcessTree(child, true);
     }
-    activeChildren.clear();
+    for (const job of jobs.values()) job.cleanup?.();
   };
 
   return {
     jobs,
     activeChildren,
+    track,
+    finish,
     cancelAll,
   };
 }

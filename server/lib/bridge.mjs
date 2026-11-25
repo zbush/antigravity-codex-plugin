@@ -22,6 +22,7 @@ export const BRIDGE_ENV_VARS = Object.freeze([
   "AGENT_BRIDGE_CODEX_WINDOWS_SANDBOX",
   "AGENT_BRIDGE_DEPTH",
   "AGENT_BRIDGE_MAX_DEPTH",
+  "AGENT_BRIDGE_MAX_CONCURRENT",
   "AGENT_BRIDGE_CHAIN",
   "AGENT_BRIDGE_CONFIG",
   "AGENT_BRIDGE_INHERITED_POLICY",
@@ -40,6 +41,7 @@ export const DEFAULT_CONFIG = Object.freeze({
     codex_to_antigravity: false,
   },
   max_depth: 1,
+  max_concurrent: 4,
   allow_cycles: false,
 });
 
@@ -82,6 +84,12 @@ function parseNonNegativeInt(raw, label, max = 10) {
   return n;
 }
 
+function parseConcurrency(raw, label) {
+  const n = typeof raw === "string" && /^\d+$/.test(raw.trim()) ? Number(raw) : raw;
+  if (!Number.isSafeInteger(n) || n < 1) throw new Error(`${label} must be a positive integer.`);
+  return n;
+}
+
 function readJsonFileStrict(filePath, required) {
   if (!fs.existsSync(filePath)) {
     if (required) {
@@ -104,10 +112,8 @@ function readJsonFileStrict(filePath, required) {
 function mergeConfigLayer(base, layer, sourceLabel) {
   if (!layer) return base;
   const next = {
-    version: base.version,
+    ...base,
     directions: { ...base.directions },
-    max_depth: base.max_depth,
-    allow_cycles: base.allow_cycles,
   };
 
   if (layer.version !== undefined) {
@@ -136,6 +142,10 @@ function mergeConfigLayer(base, layer, sourceLabel) {
     if (next.max_depth === undefined) throw new Error(`Missing max_depth value in ${sourceLabel}.`);
   }
 
+  if (layer.max_concurrent !== undefined) {
+    next.max_concurrent = parseConcurrency(layer.max_concurrent, `'max_concurrent' in ${sourceLabel}`);
+  }
+
   if (layer.allow_cycles !== undefined) {
     if (typeof layer.allow_cycles !== "boolean") {
       throw new Error(`'allow_cycles' must be a boolean in ${sourceLabel}.`);
@@ -152,10 +162,8 @@ function mergeConfigLayer(base, layer, sourceLabel) {
  */
 export function loadBridgeConfig(env = process.env, defaultUserPath = getDefaultUserConfigPath()) {
   let config = {
-    version: DEFAULT_CONFIG.version,
+    ...DEFAULT_CONFIG,
     directions: { ...DEFAULT_CONFIG.directions },
-    max_depth: DEFAULT_CONFIG.max_depth,
-    allow_cycles: DEFAULT_CONFIG.allow_cycles,
   };
 
   const sources = [];
@@ -196,6 +204,10 @@ export function loadBridgeConfig(env = process.env, defaultUserPath = getDefault
     config.max_depth = maxDepthEnv;
   }
 
+  if (env.AGENT_BRIDGE_MAX_CONCURRENT !== undefined) {
+    config.max_concurrent = parseConcurrency(env.AGENT_BRIDGE_MAX_CONCURRENT, "AGENT_BRIDGE_MAX_CONCURRENT");
+  }
+
   const allowCyclesEnv = parseBoolEnv(env.AGENT_BRIDGE_ALLOW_CYCLES, "AGENT_BRIDGE_ALLOW_CYCLES");
   if (allowCyclesEnv !== undefined) {
     config.allow_cycles = allowCyclesEnv;
@@ -212,6 +224,7 @@ export function loadBridgeConfig(env = process.env, defaultUserPath = getDefault
     const ceiling = mergeConfigLayer(config, inherited, "AGENT_BRIDGE_INHERITED_POLICY");
     for (const key of Object.values(DIRECTIONS)) config.directions[key] &&= ceiling.directions[key];
     config.max_depth = Math.min(config.max_depth, ceiling.max_depth);
+    config.max_concurrent = Math.min(config.max_concurrent, ceiling.max_concurrent);
     config.allow_cycles &&= ceiling.allow_cycles;
   }
 
@@ -276,13 +289,16 @@ export function readDelegationContext(env = process.env, recipient) {
     }
   }
 
+  if (recipient && chain.length && chain.at(-1).split("_to_")[1] !== recipient) {
+    throw new Error("Malformed AGENT_BRIDGE_CHAIN: the last hop must end at " + recipient + ".");
+  }
   return { depth, chain };
 }
 
 /**
  * Check whether a bridge server operating in `direction` is allowed to launch a new delegated agent.
  */
-export function evaluateDelegationPolicy(direction, env = process.env) {
+export function evaluateDelegationPolicy(direction, env = process.env, activeJobs = 0) {
   if (!VALID_DIRECTIONS.has(direction)) {
     throw new Error(`Unknown bridge direction: ${direction}`);
   }
@@ -348,14 +364,23 @@ export function evaluateDelegationPolicy(direction, env = process.env) {
     };
   }
 
-  if (!config.allow_cycles && context.chain.includes(direction)) {
+  const target = direction.split("_to_")[1];
+  if (!config.allow_cycles && context.chain.some(edge => edge.split("_to_")[0] === target)) {
     return {
       allowed: false,
       directionEnabled: true,
       reason: "cycle_blocked",
-      message: `Delegation cycle blocked: direction '${direction}' already appears in chain [${context.chain.join(" -> ")}]. Set allow_cycles: true to permit repeated hops up to max_depth.`,
+      message: `Delegation cycle blocked: '${target}' already sent a task in this chain. Enable allow_cycles to permit callbacks up to max_depth.`,
       config,
       context,
+    };
+  }
+
+  if (activeJobs >= config.max_concurrent) {
+    return {
+      allowed: false, directionEnabled, reason: "max_concurrent_reached",
+      message: `Concurrent job limit reached (${activeJobs}/${config.max_concurrent}).`,
+      config, context,
     };
   }
 
@@ -409,4 +434,14 @@ export function buildChildBridgeEnv(direction, evaluation, baseEnv = process.env
 export function getCodexEnvVarsOverrideArg() {
   const quoted = BRIDGE_ENV_VARS.map((k) => `"${k}"`).join(",");
   return `mcp_servers.antigravity-local.env_vars=[${quoted}]`;
+}
+
+export function delegationPrompt(sender, receiver, prompt) {
+  return [
+    "AGENT-TO-AGENT DELEGATION",
+    `Sending agent: ${sender}. Receiving agent: ${receiver}.`,
+    `This task was delegated by ${sender} on the user's behalf. The human may not have seen the sending conversation. Attribute relayed claims to ${sender}.`,
+    "---",
+    prompt,
+  ].join("\n");
 }

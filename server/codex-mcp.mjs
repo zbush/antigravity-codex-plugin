@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { hasPlainPeerRegistration, resolveCodexInvocation, serverPath } from "./lib/codex-cli.mjs";
 export { resolveCodexInvocation };
 import { loadWorkspacePolicy, resolveWorkspaceDir } from "./lib/workspace-policy.mjs";
@@ -10,21 +11,25 @@ import { loadWorkspacePolicy, resolveWorkspaceDir } from "./lib/workspace-policy
 import {
   DIRECTIONS,
   buildChildBridgeEnv,
+  delegationPrompt,
   evaluateDelegationPolicy,
   getCodexEnvVarsOverrideArg,
 } from "./lib/bridge.mjs";
-import { createRpcError, startMcpStdioServer } from "./lib/mcp.mjs";
+import { createRpcError, startMcpStdioServer, validateToolArguments } from "./lib/mcp.mjs";
+import { bridgeStatus } from "./lib/status.mjs";
 import {
   MAX_RECENT_EVENTS,
   MAX_STDERR_CHARS,
   clampTimeoutMs,
   createJobRegistry,
+  isClosedStdinError,
   terminateProcessTree,
 } from "./lib/process.mjs";
 
 const SERVER_NAME = "codex-local";
-const SERVER_VERSION = "2.0.0";
+const SERVER_VERSION = "2.1.0";
 const DIRECTION = DIRECTIONS.ANTIGRAVITY_TO_CODEX;
+const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 
 const LAUNCH_TOOL_NAMES = new Set([
   "codex_run",
@@ -33,8 +38,6 @@ const LAUNCH_TOOL_NAMES = new Set([
   "codex_review",
   "codex_spawn",
 ]);
-
-const registry = createJobRegistry();
 
 function buildCodexArgs(mode, params, lastMessagePath, includeAntigravityEnvVars) {
   const args = ["--no-daemon", "-a", "never", "exec", "--ignore-user-config", "-s", params.sandbox];
@@ -107,11 +110,11 @@ function buildCodexArgs(mode, params, lastMessagePath, includeAntigravityEnvVars
     if (params.uncommitted) args.push("--uncommitted");
     if (params.base) args.push("--base", String(params.base));
     if (params.commit) args.push("--commit", String(params.commit));
-    if (!hasExplicitTarget && !params.prompt) {
+    const hasPrompt = Boolean(params.prompt?.trim());
+    if (!hasExplicitTarget && !hasPrompt) {
       args.push("--uncommitted");
     }
 
-    const hasPrompt = typeof params.prompt === "string" && params.prompt.trim().length > 0;
     if (hasPrompt) {
       args.push("-");
     }
@@ -160,23 +163,34 @@ function summarizeEvent(evt) {
   return null;
 }
 
-function assertLaunchAllowed() {
-  const evaluation = evaluateDelegationPolicy(DIRECTION);
+function policy(registry) {
+  const evaluation = evaluateDelegationPolicy(DIRECTION, process.env, registry.activeChildren.size);
   if (!evaluation.directionEnabled) {
     registry.cancelAll("Direction disabled by user policy.");
-  }
-  if (!evaluation.allowed) {
-    throw createRpcError(-32602, evaluation.message, {
-      reason: evaluation.reason,
-      direction: DIRECTION,
-      chain: evaluation.context?.chain ?? [],
-      max_depth: evaluation.config?.max_depth ?? null,
-    });
   }
   return evaluation;
 }
 
-function createRunner(mode, rawParams, evaluation) {
+function readLastMessage(file) {
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) throw new Error("Codex final message must be a regular file.");
+    if (stat.size > MAX_OUTPUT_BYTES) throw new Error("Codex final message exceeded 4 MiB.");
+    const bytes = Buffer.alloc(stat.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const count = fs.readSync(fd, bytes, offset, bytes.length - offset, null);
+      if (count === 0) break;
+      offset += count;
+    }
+    return bytes.toString("utf8", 0, offset).trim();
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function createRunner(registry, mode, rawParams, evaluation, signal) {
   const policy = loadWorkspacePolicy();
   let cwd, params;
   try {
@@ -185,7 +199,6 @@ function createRunner(mode, rawParams, evaluation) {
     if (sandbox !== "read-only" && !(sandbox === "workspace-write" && policy.allowEdits)) {
       throw new Error("Use read-only, or enable AGENT_BRIDGE_ALLOW_EDITS=true for workspace-write.");
     }
-    if (rawParams.profile !== undefined || rawParams.worktree) throw new Error("Profiles and managed worktrees are outside the launch policy.");
     for (const key of ["model", "session_id", "base", "commit", "title"]) {
       const value = rawParams[key];
       if (value !== undefined && (typeof value !== "string" || !value.trim() || /^\s*-/.test(value))) throw new Error("Invalid " + key + ".");
@@ -207,20 +220,14 @@ function createRunner(mode, rawParams, evaluation) {
       params.last = false;
     }
   } catch (error) { throw createRpcError(-32602, error.message); }
-  if ((mode === "run" || mode === "resume" || mode === "fork") && !String(rawParams.prompt || "").trim()) {
-    throw new Error(`'prompt' is required for mode '${mode}'.`);
+  if (mode !== "review" && !rawParams.prompt?.trim()) {
+    throw createRpcError(-32602, `'prompt' is required for mode '${mode}'.`);
   }
 
-  const jobId = crypto.randomUUID().slice(0, 8);
-  const lastMessagePath = path.join(
-    os.tmpdir(),
-    `codex-mcp-last-${jobId}-${Date.now()}.txt`
-  );
-  const canReturn = evaluation.config.directions[DIRECTIONS.CODEX_TO_ANTIGRAVITY] &&
+  const jobId = crypto.randomUUID();
+  const canReturn = evaluation.config.allow_cycles && evaluation.config.directions[DIRECTIONS.CODEX_TO_ANTIGRAVITY] &&
     evaluation.context.depth + 1 < evaluation.config.max_depth && (evaluation.context.envelope?.remaining_hops ?? Infinity) > 1;
   const includeEnvVars = canReturn && hasPlainPeerRegistration();
-  const { args, stdinPrompt } = buildCodexArgs(mode, params, lastMessagePath, includeEnvVars);
-  const invocation = resolveCodexInvocation(args);
   const timeoutMs = clampTimeoutMs(params.timeout_seconds);
   const { env: childEnv, nextDepth, nextChain } = buildChildBridgeEnv(DIRECTION, evaluation);
   childEnv.AGENT_BRIDGE_WORKSPACE_ROOTS = JSON.stringify([cwd, ...params.add_dirs]);
@@ -242,7 +249,6 @@ function createRunner(mode, rawParams, evaluation) {
     exit_code: null,
     signal: null,
     response: "",
-    messages: [],
     commands: [],
     file_changes: [],
     usage: null,
@@ -254,6 +260,7 @@ function createRunner(mode, rawParams, evaluation) {
   };
 
   let stdoutBuffer = "";
+  let stdoutBytes = 0;
   let settled = false;
   let cancelRequested = false;
   let timedOut = false;
@@ -262,11 +269,13 @@ function createRunner(mode, rawParams, evaluation) {
   let exitGraceTimer = null;
   let forceKillTimer = null;
 
-  const cleanupTempFile = () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-mcp-"));
+  const lastMessagePath = path.join(tempDir, "last-message.txt");
+  const cleanupTempDir = () => {
     try {
-      if (fs.existsSync(lastMessagePath)) fs.unlinkSync(lastMessagePath);
+      fs.rmSync(tempDir, { recursive: true, force: true });
     } catch {
-      // ignore temp cleanup failure
+      // Best-effort cleanup if the filesystem is unavailable.
     }
   };
 
@@ -280,6 +289,7 @@ function createRunner(mode, rawParams, evaluation) {
       return;
     }
 
+    if (!evt || typeof evt !== "object") return;
     if (evt.type === "thread.started" && evt.thread_id) {
       state.session_id = evt.thread_id;
     }
@@ -299,7 +309,6 @@ function createRunner(mode, rawParams, evaluation) {
     if (evt.type === "item.completed" && evt.item) {
       const item = evt.item;
       if (item.type === "agent_message" && typeof item.text === "string") {
-        state.messages.push(item.text);
         state.response = item.text;
       } else if (item.type === "command_execution") {
         state.commands.push({
@@ -321,27 +330,35 @@ function createRunner(mode, rawParams, evaluation) {
     }
   };
 
-  const donePromise = new Promise((resolve) => {
+  let stdinPrompt;
+  try {
+    const prepared = buildCodexArgs(mode, params, lastMessagePath, includeEnvVars);
+    stdinPrompt = prepared.stdinPrompt;
+    const invocation = resolveCodexInvocation(prepared.args);
     child = spawn(invocation.command, invocation.args, {
       cwd,
       env: childEnv,
       shell: invocation.shell,
-      windowsVerbatimArguments: invocation.windowsVerbatimArguments,
       detached: process.platform !== "win32",
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
+  } catch (error) {
+    cleanupTempDir();
+    throw error;
+  }
 
+  const donePromise = new Promise((resolve) => {
     state.pid = child.pid ?? null;
-    registry.activeChildren.add(child);
+    state.cleanup = cleanupTempDir;
 
-    const finalize = (status, code, signal) => {
+    const finalize = (status, code, exitSignal) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
       if (exitGraceTimer) clearTimeout(exitGraceTimer);
       if (forceKillTimer) clearTimeout(forceKillTimer);
-      registry.activeChildren.delete(child);
+      signal?.removeEventListener("abort", abort);
 
       try {
         child.stdout?.destroy();
@@ -355,28 +372,29 @@ function createRunner(mode, rawParams, evaluation) {
         stdoutBuffer = "";
       }
 
-      if (!state.response && fs.existsSync(lastMessagePath)) {
+      if (!state.response) {
         try {
-          state.response = fs.readFileSync(lastMessagePath, "utf8").trim();
-        } catch {
-          // ignore read errors
+          state.response = readLastMessage(lastMessagePath);
+        } catch (error) {
+          if (error.code !== "ENOENT") state.errors.push(error.message);
         }
       }
-      cleanupTempFile();
+      cleanupTempDir();
 
-      state.status = status;
+      state.status = status === "completed" && state.errors.length ? "failed" : status;
       state.exit_code = code;
-      state.signal = signal;
+      state.signal = exitSignal;
       state.completed_at = new Date().toISOString();
+      registry.finish(state, child);
       resolve(state);
     };
 
-    const requestTermination = (targetStatus, reason) => {
+    const requestTermination = (targetStatus, reason, force = false) => {
       if (settled || !child) return false;
       state.errors.push(reason);
       if (targetStatus === "cancelled") cancelRequested = true;
       if (targetStatus === "timed_out") timedOut = true;
-      terminateProcessTree(child, false);
+      terminateProcessTree(child, force);
       if (!forceKillTimer) {
         forceKillTimer = setTimeout(() => {
           if (!settled) {
@@ -391,6 +409,8 @@ function createRunner(mode, rawParams, evaluation) {
 
     state.cancel = (reason = "Cancelled by caller.") =>
       requestTermination("cancelled", reason);
+    const abort = () => requestTermination("cancelled", "MCP request cancelled.", true);
+    signal?.addEventListener("abort", abort, { once: true });
 
     timer = setTimeout(() => {
       requestTermination("timed_out", `Timed out after ${Math.round(timeoutMs / 1000)}s.`);
@@ -399,6 +419,13 @@ function createRunner(mode, rawParams, evaluation) {
 
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
+      if (stdoutBytes > MAX_OUTPUT_BYTES) return;
+      stdoutBytes += Buffer.byteLength(chunk);
+      if (stdoutBytes > MAX_OUTPUT_BYTES) {
+        stdoutBuffer = "";
+        requestTermination("failed", "Codex stdout exceeded 4 MiB.", true);
+        return;
+      }
       stdoutBuffer += chunk;
       let idx;
       while ((idx = stdoutBuffer.indexOf("\n")) !== -1) {
@@ -439,13 +466,11 @@ function createRunner(mode, rawParams, evaluation) {
       finalize(resolveExitStatus(code), code, signal);
     });
 
-    if (stdinPrompt !== null) {
-      child.stdin.write(stdinPrompt);
-    }
-    child.stdin.end();
+    child.stdin.on("error", err => { if (!isClosedStdinError(err)) state.errors.push(err.message); });
+    child.stdin.end(stdinPrompt === null ? undefined : delegationPrompt("Google Antigravity", "Codex", stdinPrompt));
   });
 
-  registry.jobs.set(jobId, state);
+  registry.track(state, child);
   return { state, donePromise };
 }
 
@@ -466,10 +491,11 @@ function formatStatePayload(state, includeFullOutput = true) {
     elapsed_seconds: elapsedSeconds,
     exit_code: state.exit_code,
     usage: state.usage,
-    commands_run: state.commands.length,
-    file_changes_count: state.file_changes.length,
+    commands_run: state.commands_run ?? state.commands.length,
+    file_changes_count: state.file_changes_count ?? state.file_changes.length,
     errors: state.errors,
   };
+  if (state.output_pruned) payload.output_pruned = true;
   if (includeFullOutput) {
     payload.response = state.response;
     if (state.commands.length > 0) payload.commands = state.commands.slice(-20);
@@ -493,6 +519,7 @@ const ALL_TOOLS = [
       "Run a local OpenAI Codex CLI agent synchronously on a task and return its final response, session_id (for resuming/forking), commands executed, and token usage.",
     inputSchema: {
       type: "object",
+      additionalProperties: false,
       properties: {
         prompt: {
           type: "string",
@@ -539,7 +566,9 @@ const ALL_TOOLS = [
       "Continue an existing local Codex agent session by session_id (or the most recent session with last: true) with follow-up instructions.",
     inputSchema: {
       type: "object",
+      additionalProperties: false,
       properties: {
+        sandbox: { type: "string", enum: ["read-only", "workspace-write"] },
         session_id: {
           type: "string",
           description: "Session UUID returned from an earlier codex_run or codex_spawn call.",
@@ -578,7 +607,9 @@ const ALL_TOOLS = [
       "Fork an existing local Codex session into a new independent thread with new instructions.",
     inputSchema: {
       type: "object",
+      additionalProperties: false,
       properties: {
+        sandbox: { type: "string", enum: ["read-only", "workspace-write"] },
         session_id: {
           type: "string",
           description: "Existing Codex session UUID to fork.",
@@ -613,6 +644,7 @@ const ALL_TOOLS = [
       "Run a non-interactive code review with local Codex against uncommitted changes, a base branch, or a specific commit.",
     inputSchema: {
       type: "object",
+      additionalProperties: false,
       properties: {
         cwd: {
           type: "string",
@@ -656,6 +688,7 @@ const ALL_TOOLS = [
       "Start a local Codex agent asynchronously in the background and immediately return a job_id. Use this to orchestrate multiple local Codex agents in parallel or for tasks exceeding ~2 minutes, then poll with codex_job_status.",
     inputSchema: {
       type: "object",
+      additionalProperties: false,
       properties: {
         mode: {
           type: "string",
@@ -702,6 +735,7 @@ const ALL_TOOLS = [
       "Inspect the status and output of a background Codex job started by codex_spawn, or list all tracked jobs when job_id is omitted.",
     inputSchema: {
       type: "object",
+      additionalProperties: false,
       properties: {
         job_id: {
           type: "string",
@@ -715,6 +749,7 @@ const ALL_TOOLS = [
     description: "Cancel a currently running background Codex job by job_id.",
     inputSchema: {
       type: "object",
+      additionalProperties: false,
       properties: {
         job_id: {
           type: "string",
@@ -724,100 +759,55 @@ const ALL_TOOLS = [
       required: ["job_id"],
     },
   },
+  {
+    name: "codex_status",
+    description: "Inspect the Codex CLI, workspace, delegation policy and job capacity.",
+    annotations: { readOnlyHint: true },
+    inputSchema: { type: "object", additionalProperties: false, properties: {} },
+  },
 ];
 
-function getVisibleTools() {
-  const evaluation = evaluateDelegationPolicy(DIRECTION);
-  if (!evaluation.directionEnabled) {
-    registry.cancelAll("Direction disabled by user policy.");
-    return [];
-  }
+function getVisibleTools(registry) {
+  const evaluation = policy(registry);
+  if (!evaluation.directionEnabled) return [];
   if (!evaluation.allowed) {
-    // At depth/cycle limit: hide launch tools, keep inspection/cancellation tools.
     return ALL_TOOLS.filter((tool) => !LAUNCH_TOOL_NAMES.has(tool.name));
   }
   return ALL_TOOLS;
 }
 
-async function handleToolCall(name, args = {}) {
-  if (LAUNCH_TOOL_NAMES.has(name)) {
-    const evaluation = assertLaunchAllowed();
-
-    if (name === "codex_run") {
-      const { donePromise } = createRunner("run", args, evaluation);
-      const result = await donePromise;
-      return {
-        content: [{ type: "text", text: JSON.stringify(formatStatePayload(result, true), null, 2) }],
-        isError: result.status !== "completed",
-      };
-    }
-
-    if (name === "codex_resume") {
-      const { donePromise } = createRunner("resume", args, evaluation);
-      const result = await donePromise;
-      return {
-        content: [{ type: "text", text: JSON.stringify(formatStatePayload(result, true), null, 2) }],
-        isError: result.status !== "completed",
-      };
-    }
-
-    if (name === "codex_fork") {
-      const { donePromise } = createRunner("fork", args, evaluation);
-      const result = await donePromise;
-      return {
-        content: [{ type: "text", text: JSON.stringify(formatStatePayload(result, true), null, 2) }],
-        isError: result.status !== "completed",
-      };
-    }
-
-    if (name === "codex_review") {
-      const { donePromise } = createRunner("review", args, evaluation);
-      const result = await donePromise;
-      return {
-        content: [{ type: "text", text: JSON.stringify(formatStatePayload(result, true), null, 2) }],
-        isError: result.status !== "completed",
-      };
-    }
-
-    if (name === "codex_spawn") {
-      const mode = args.mode || "run";
-      const { state } = createRunner(mode, args, evaluation);
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                job_id: state.job_id,
-                mode: state.mode,
-                status: state.status,
-                pid: state.pid,
-                cwd: state.cwd,
-                delegation_depth: state.delegation_depth,
-                delegation_chain: state.delegation_chain,
-                started_at: state.started_at,
-              },
-              null,
-              2
-            ),
-          },
-        ],
-      };
-    }
-  }
-
-  // Non-launch tools (status/cancel): reject only if the entire direction is disabled.
-  const evaluation = evaluateDelegationPolicy(DIRECTION);
-  if (!evaluation.directionEnabled) {
-    registry.cancelAll("Direction disabled by user policy.");
+async function handleToolCall(registry, name, args = {}, signal) {
+  const evaluation = policy(registry);
+  const launching = LAUNCH_TOOL_NAMES.has(name);
+  if (!evaluation.directionEnabled || (launching && !evaluation.allowed)) {
     throw createRpcError(-32602, evaluation.message, {
-      reason: evaluation.reason,
-      direction: DIRECTION,
+      reason: evaluation.reason, direction: DIRECTION,
+      chain: evaluation.context?.chain ?? [], max_depth: evaluation.config?.max_depth ?? null,
     });
   }
+  const tool = ALL_TOOLS.find(tool => tool.name === name);
+  if (!tool) throw createRpcError(-32601, `Unknown tool: ${name}`);
+  validateToolArguments(tool, args);
+
+  if (launching) {
+    const background = name === "codex_spawn";
+    const mode = background ? args.mode ?? "run" : name.slice("codex_".length);
+    const { state, donePromise } = createRunner(registry, mode, args, evaluation, background ? undefined : signal);
+    if (background) {
+      const { job_id, status, pid, cwd, delegation_depth, delegation_chain, started_at } = state;
+      const job = { job_id, mode, status, pid, cwd, delegation_depth, delegation_chain, started_at };
+      return { content: [{ type: "text", text: JSON.stringify(job, null, 2) }] };
+    }
+    const result = await donePromise;
+    return {
+      content: [{ type: "text", text: JSON.stringify(formatStatePayload(result, true), null, 2) }],
+      isError: result.status !== "completed",
+    };
+  }
+  if (name === "codex_status") return bridgeStatus(resolveCodexInvocation, evaluation, registry, signal);
 
   if (name === "codex_job_status") {
-    if (args.job_id) {
+    if (args.job_id !== undefined) {
       const job = registry.jobs.get(String(args.job_id));
       if (!job) {
         return {
@@ -886,16 +876,15 @@ async function handleToolCall(name, args = {}) {
 }
 
 export function startCodexMcpServer() {
-  return startMcpStdioServer({
+  const registry = createJobRegistry(() => server.notifyToolsListChangedIfNeeded(getVisibleTools(registry)));
+  const server = startMcpStdioServer({
     serverName: SERVER_NAME,
     serverVersion: SERVER_VERSION,
-    getTools: getVisibleTools,
-    callTool: handleToolCall,
+    getTools: () => getVisibleTools(registry),
+    callTool: (name, args, signal) => handleToolCall(registry, name, args, signal),
     onShutdown: () => registry.cancelAll("MCP server shutting down."),
   });
+  return server;
 }
 
-if (import.meta.url === `file://${process.argv[1]?.replace(/\\/g, "/")}` ||
-    process.argv[1]?.endsWith("codex-mcp.mjs")) {
-  startCodexMcpServer();
-}
+if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) startCodexMcpServer();

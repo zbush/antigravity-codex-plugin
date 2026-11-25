@@ -10,7 +10,7 @@ const DEFAULT_PROTOCOL_VERSION = "2024-11-05";
  * - serverName: string
  * - serverVersion: string
  * - getTools: () => Array<ToolDefinition>
- * - callTool: (name, args) => Promise<CallToolResult>
+ * - callTool: (name, args, signal) => Promise<CallToolResult>
  * - onShutdown: () => void
  */
 export function startMcpStdioServer({
@@ -30,6 +30,7 @@ export function startMcpStdioServer({
   let initialized = false;
   let lastToolNamesKey = null;
   let inFlightRequests = 0;
+  const requests = new Map();
   let stdinClosed = false;
 
   const log = (message) => {
@@ -81,7 +82,12 @@ export function startMcpStdioServer({
         return;
       }
 
-      if (method === "notifications/initialized" || method === "notifications/cancelled") {
+      if (method === "notifications/cancelled") {
+        requests.get(params?.requestId)?.abort();
+        return;
+      }
+
+      if (method === "notifications/initialized") {
         return;
       }
 
@@ -99,11 +105,18 @@ export function startMcpStdioServer({
 
       if (method === "tools/call") {
         const toolName = params?.name;
-        const toolArgs = params?.arguments || {};
+        const toolArgs = params?.arguments === undefined ? {} : params.arguments;
         const tools = getTools();
         notifyToolsListChangedIfNeeded(tools);
-        const result = await callTool(toolName, toolArgs);
-        sendResult(id, result);
+        if (requests.has(id)) throw createRpcError(-32600, "Duplicate in-flight request ID.");
+        const controller = new AbortController();
+        if (!isNotification) requests.set(id, controller);
+        try {
+          const result = await callTool(toolName, toolArgs, controller.signal);
+          if (!isNotification) sendResult(id, result);
+        } finally {
+          if (!isNotification) requests.delete(id);
+        }
         return;
       }
 
@@ -181,4 +194,25 @@ export function createRpcError(code, message, data) {
   err.rpcCode = code;
   if (data !== undefined) err.rpcData = data;
   return err;
+}
+
+export function validateToolArguments(tool, args) {
+  if (!args || typeof args !== "object" || Array.isArray(args)) {
+    throw createRpcError(-32602, "Tool arguments must be an object.");
+  }
+  const { properties, required = [] } = tool.inputSchema;
+  for (const key of required) {
+    if (!Object.hasOwn(args, key)) throw createRpcError(-32602, `'${key}' is required for ${tool.name}.`);
+  }
+  for (const [key, value] of Object.entries(args)) {
+    if (!Object.hasOwn(properties, key)) throw createRpcError(-32602, `Unknown parameter '${key}' for ${tool.name}.`);
+    const spec = properties[key];
+    const type = Array.isArray(value) ? "array" : typeof value;
+    const invalidType = spec.type === "integer" ? !Number.isInteger(value)
+      : spec.type === "number" ? (typeof value !== "number" || !Number.isFinite(value))
+      : spec.type && (type !== spec.type || value === null);
+    if (invalidType || (spec.enum && !spec.enum.includes(value)) || (spec.const !== undefined && value !== spec.const)) {
+      throw createRpcError(-32602, `Invalid '${key}' for ${tool.name}.`);
+    }
+  }
 }

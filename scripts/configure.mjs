@@ -9,7 +9,7 @@ import { BRIDGE_ENV_VARS, resolvePolicyPath, loadBridgeConfig } from "../server/
 const modes = {
   "agy-master": [true, false, 1],
   "codex-master": [false, true, 1],
-  bidirectional: [true, true, 2],
+  bidirectional: [true, true, 1],
   off: [false, false, 0],
 };
 const usage = [
@@ -116,7 +116,7 @@ function configurePolicy(file, opts) {
 function ensureEnvVars(info) {
   const missing = BRIDGE_ENV_VARS.filter((key) => !info.transport.env_vars?.includes(key));
   if (!missing.length) return;
-  const file = path.join(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"), "config.toml");
+  const file = path.join(process.env.CODEX_HOME?.trim() || path.join(os.homedir(), ".codex"), "config.toml");
   const source = fs.readFileSync(file, "utf8");
   const key = /^\s*(?:env_vars|"env_vars"|'env_vars')\s*=\s*\[/;
   let table, arrayStart;
@@ -157,6 +157,7 @@ function configureRegistration(opts) {
   }
   if (wire) {
     if (!ours) {
+      if (info) codex(["remove", serverName]);
       codex(["add", serverName, "--", process.execPath, serverPath]);
       info = registration();
       if (!info || !matches(info)) throw new Error("Codex did not register the expected command.");

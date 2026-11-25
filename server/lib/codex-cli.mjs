@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { configuredFile, findWindowsCommand, windowsBatchInvocation } from "./process.mjs";
+import { cliInvocation, configuredFile, findWindowsCommand } from "./process.mjs";
 
 export const serverName = "antigravity-local";
 export const serverPath = fileURLToPath(new URL("../antigravity-mcp.mjs", import.meta.url));
@@ -11,25 +11,10 @@ export const peerTable = /^\s*\[\s*(?:mcp_servers|"mcp_servers"|'mcp_servers')\s
 
 export function resolveCodexInvocation(codexArgs, env = process.env) {
   const configuredBin = configuredFile(env.CODEX_BIN, "CODEX_BIN");
-  if (configuredBin) {
-    if (process.platform === "win32" && /\.(cmd|bat)$/i.test(configuredBin)) {
-      return windowsBatchInvocation(configuredBin, codexArgs);
-    }
-    return {
-      command: configuredBin,
-      args: codexArgs,
-      shell: false,
-    };
-  }
+  if (configuredBin) return cliInvocation(configuredBin, codexArgs, "CODEX_BIN");
 
   const configuredJs = configuredFile(env.CODEX_CLI_JS, "CODEX_CLI_JS");
-  if (configuredJs) {
-    return {
-      command: process.execPath,
-      args: [configuredJs, ...codexArgs],
-      shell: false,
-    };
-  }
+  if (configuredJs) return cliInvocation(configuredJs, codexArgs, "CODEX_CLI_JS");
 
   const nodeDir = path.dirname(process.execPath);
   const npmPrefix = env.NPM_CONFIG_PREFIX || env.npm_config_prefix;
@@ -49,31 +34,18 @@ export function resolveCodexInvocation(codexArgs, env = process.env) {
 
   for (const candidate of candidateJsPaths) {
     if (path.isAbsolute(candidate) && fs.statSync(candidate, { throwIfNoEntry: false })?.isFile()) {
-      return {
-        command: process.execPath,
-        args: [candidate, ...codexArgs],
-        shell: false,
-      };
+      return cliInvocation(candidate, codexArgs, "npm installation");
     }
   }
 
-  if (process.platform === "win32") {
-    const command = findWindowsCommand("codex", env);
-    if (/\.(cmd|bat)$/i.test(command)) return windowsBatchInvocation(command, codexArgs);
-    return { command, args: codexArgs, shell: false };
-  }
-
-  return {
-    command: "codex",
-    args: codexArgs,
-    shell: false,
-  };
+  const command = process.platform === "win32" ? findWindowsCommand("codex", env) : "codex";
+  return cliInvocation(command, codexArgs, "PATH");
 }
 
 export function codex(args, allowMissing = false) {
   const invocation = resolveCodexInvocation(["mcp", ...args]);
   const run = spawnSync(invocation.command, invocation.args, {
-    windowsVerbatimArguments: invocation.windowsVerbatimArguments, windowsHide: true,
+    windowsHide: true,
     encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 30000,
   });
   if (run.error) throw run.error;
