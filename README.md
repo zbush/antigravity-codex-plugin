@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.png" alt="Antigravity <-> Codex Bridge Logo" width="128" height="128" />
+  <img src="assets/logo.png" alt="Six-loop Codex knot surrounding the Antigravity arch and a terminal prompt" width="128" height="128" />
 </p>
 
 # Antigravity ↔ Codex Bridge

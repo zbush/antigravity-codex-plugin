@@ -255,7 +255,11 @@ for (const [name, direction, incoming] of [["codex", forward, reverse], ["antigr
     assert.match(denied.error.message, /configure\.mjs --wire-codex/);
     const client = f.connect(name, { ...nested, AGENT_BRIDGE_INHERITED_POLICY: JSON.stringify(policy) });
     const init = (await client.request("initialize", { protocolVersion: "2024-11-05" })).result;
-    assert.deepEqual(init.serverInfo, { name: name + "-local", version: "2.0.0" });
+    const icon = fs.readFileSync(path.join(root, "assets", "icon-64.png"), "base64");
+    assert.deepEqual(init.serverInfo, {
+      name: name + "-local", version: "2.0.0",
+      icons: [{ src: "data:image/png;base64," + icon, mimeType: "image/png", sizes: ["64x64"] }],
+    });
     assert.equal(init.capabilities.tools.listChanged, true);
     const run = name + "_run";
     const inspect = [name + "_job_status", name + "_job_cancel"];
