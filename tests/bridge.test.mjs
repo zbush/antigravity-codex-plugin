@@ -47,7 +47,7 @@ async function mockAgy() {
     structured_output: {
       message, args: process.argv.slice(2), cwd: process.cwd(),
       depth: process.env.AGENT_BRIDGE_DEPTH, chain: process.env.AGENT_BRIDGE_CHAIN,
-      maxDepth: process.env.AGENT_BRIDGE_MAX_DEPTH,
+      maxDepth: JSON.parse(process.env.AGENT_BRIDGE_INHERITED_POLICY ?? "{}").max_depth,
     },
   };
   if (prompt === "cli error") result.error = "model error";
@@ -63,7 +63,7 @@ async function mockCodex() {
   for await (const chunk of process.stdin) prompt += chunk;
   const context = {
     depth: process.env.AGENT_BRIDGE_DEPTH, chain: process.env.AGENT_BRIDGE_CHAIN,
-    maxDepth: process.env.AGENT_BRIDGE_MAX_DEPTH, prompt,
+    maxDepth: JSON.parse(process.env.AGENT_BRIDGE_INHERITED_POLICY).max_depth, prompt,
   };
   console.log(JSON.stringify({ type: "thread.started", thread_id: "codex-id" }));
   console.log(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify(context) } }));
@@ -192,7 +192,8 @@ test("invalid policies and malformed delegation contexts fail closed", (t) => {
 
 test("depth, repeated hops, and child environment propagation", (t) => {
   const { env, file } = fixture(t);
-  const base = { ...env, AGENT_BRIDGE_DEPTH: "2", AGENT_BRIDGE_CHAIN: JSON.stringify([reverse, forward]) };
+  const base = { ...env, AGENT_BRIDGE_DEPTH: "2", AGENT_BRIDGE_CHAIN: JSON.stringify([reverse, forward]),
+    AGENT_BRIDGE_INHERITED_POLICY: JSON.stringify({ ...policy, allow_cycles: true }) };
   assert.deepEqual(readDelegationContext({}), { depth: 0, chain: [] });
   assert.equal(evaluateDelegationPolicy(reverse, base).reason, "cycle_blocked");
   assert.equal(evaluateDelegationPolicy(reverse, { ...base, AGENT_BRIDGE_MAX_DEPTH: "2" }).reason, "max_depth_reached");
@@ -202,17 +203,34 @@ test("depth, repeated hops, and child environment propagation", (t) => {
   assert.deepEqual(child.nextChain, [reverse, forward, reverse]);
   assert.equal(child.nextDepth, 3);
   assert.deepEqual(readDelegationContext(child.env), { depth: 3, chain: child.nextChain });
-  assert.deepEqual([
-    child.env.AGENT_BRIDGE_MAX_DEPTH, child.env.AGENT_BRIDGE_ANTIGRAVITY_TO_CODEX,
-    child.env.AGENT_BRIDGE_CODEX_TO_ANTIGRAVITY, child.env.AGENT_BRIDGE_ALLOW_CYCLES,
-    child.env.AGENT_BRIDGE_CONFIG, child.env.PRESERVED, base.AGENT_BRIDGE_DEPTH,
-  ], ["4", "true", "true", "true", file, "yes", "2"]);
+  assert.deepEqual(JSON.parse(child.env.AGENT_BRIDGE_INHERITED_POLICY), evaluation.config);
+  assert.deepEqual([child.env.AGENT_BRIDGE_CONFIG, child.env.PRESERVED, base.AGENT_BRIDGE_DEPTH], [file, "yes", "2"]);
+});
+
+test("nested servers honor revocation and cannot gain authority from a looser policy file", t => {
+  const { env, file } = fixture(t);
+  writeJson(file, { ...policy, max_depth: 2 });
+  const child = buildChildBridgeEnv(forward, evaluateDelegationPolicy(forward, env), env).env;
+  assert.equal(evaluateDelegationPolicy(reverse, child).allowed, true);
+  writeJson(file, { ...policy, directions: { [forward]: true, [reverse]: false } });
+  assert.equal(evaluateDelegationPolicy(reverse, child).reason, "direction_disabled");
+  writeJson(file, { ...policy, max_depth: 8, allow_cycles: true });
+  const after = evaluateDelegationPolicy(reverse, child);
+  assert.equal(after.config.max_depth, 2);
+  assert.equal(after.config.allow_cycles, false);
+  assert.equal(evaluateDelegationPolicy(reverse, { ...child, AGENT_BRIDGE_INHERITED_POLICY: "{}" }).reason, "invalid_config");
 });
 
 for (const [name, direction, incoming] of [["codex", forward, reverse], ["antigravity", reverse, forward]]) {
   test(name + " stdio initialization, delegation, and live policy enforcement", async (t) => {
     const f = fixture(t);
-    const client = f.connect(name, { AGENT_BRIDGE_DEPTH: "1", AGENT_BRIDGE_CHAIN: JSON.stringify([incoming]) });
+    const nested = { AGENT_BRIDGE_DEPTH: "1", AGENT_BRIDGE_CHAIN: JSON.stringify([incoming]) };
+    const legacy = f.connect(name, nested);
+    assert.ok(!(await legacy.tools()).includes(name + "_run"));
+    const denied = await legacy.call(name + "_run", { cwd: f.dir, prompt: "fixture" });
+    assertDenied(denied, "invalid_config");
+    assert.match(denied.error.message, /configure\.mjs --wire-codex/);
+    const client = f.connect(name, { ...nested, AGENT_BRIDGE_INHERITED_POLICY: JSON.stringify(policy) });
     const init = (await client.request("initialize", { protocolVersion: "2024-11-05" })).result;
     assert.deepEqual(init.serverInfo, { name: name + "-local", version: "2.0.0" });
     assert.equal(init.capabilities.tools.listChanged, true);
@@ -230,7 +248,7 @@ for (const [name, direction, incoming] of [["codex", forward, reverse], ["antigr
     const context = name === "codex" ? JSON.parse(job.response) : job.structured_output;
     assert.equal(context.depth, "2");
     assert.deepEqual(JSON.parse(context.chain), expectedChain);
-    assert.equal(context.maxDepth, "4");
+    assert.equal(context.maxDepth, 4);
     if (name === "codex") {
       assert.equal(context.prompt, args.prompt);
       assert.equal(job.session_id, "codex-id");
@@ -322,7 +340,9 @@ test("AGY_BIN and platform installation defaults take precedence over PATH", (t)
   assert.deepEqual(resolveAgyInvocation(["flag"], f.env), {
     command: process.execPath, args: [f.env.AGY_BIN, "flag"], shell: false,
   });
-  const env = { AGY_BIN: path.join(f.dir, "missing"), PATH: f.dir, HOME: f.dir, USERPROFILE: f.dir, LOCALAPPDATA: f.dir };
+  const env = { PATH: f.dir, HOME: f.dir, USERPROFILE: f.dir, LOCALAPPDATA: f.dir };
+  assert.throws(() => resolveAgyInvocation([], { ...env, AGY_BIN: path.join(f.dir, "missing") }), /AGY_BIN/);
+  if (process.platform === "win32") assert.throws(() => resolveAgyInvocation([], env), /absolute executable path/);
   const windows = process.platform === "win32";
   const local = path.join(f.dir, ".local", "bin", windows ? "agy.exe" : "agy");
   fs.mkdirSync(path.dirname(local), { recursive: true });
@@ -338,7 +358,7 @@ test("AGY_BIN and platform installation defaults take precedence over PATH", (t)
     const cmd = path.join(f.dir, "agy.cmd"), exe = path.join(f.dir, "agy.exe");
     fs.writeFileSync(cmd, '@echo off\r\n"' + process.execPath + '" "%~dp0mock agy.cjs" %*\r\n');
     fs.writeFileSync(exe, "");
-    assert.equal(resolveAgyInvocation([], env).command, exe);
+    assert.equal(resolveAgyInvocation([], { ...env, PATH: '"' + f.dir + '"' }).command, exe);
     fs.unlinkSync(exe);
     const args = ["--json-schema", JSON.stringify({ description: 'quoted "text" & literal %AGY_BIN% (!)' })];
     const invocation = resolveAgyInvocation(args, env);
@@ -350,6 +370,19 @@ test("AGY_BIN and platform installation defaults take precedence over PATH", (t)
     assert.equal(run.status, 0, run.stderr);
     const result = JSON.parse(run.stdout.trim().split("\n").pop()).result;
     assert.deepEqual(result.structured_output.args, args);
+    const systemRoot = process.env.SystemRoot, windir = process.env.WINDIR;
+    try {
+      process.env.SystemRoot = "relative";
+      process.env.WINDIR = f.dir;
+      assert.equal(resolveAgyInvocation([], env).command, path.join(f.dir, "System32", "cmd.exe"));
+      delete process.env.WINDIR;
+      assert.throws(() => resolveAgyInvocation([], env), /fully qualified SystemRoot or WINDIR/);
+    } finally {
+      if (systemRoot === undefined) delete process.env.SystemRoot;
+      else process.env.SystemRoot = systemRoot;
+      if (windir === undefined) delete process.env.WINDIR;
+      else process.env.WINDIR = windir;
+    }
   }
 });
 
@@ -403,6 +436,16 @@ function configurator(f) {
     return run.stdout + run.stderr;
   };
 }
+
+test("configurator edits the runtime environment-selected file", t => {
+  const f = fixture(t);
+  const run = spawnSync(process.execPath, [path.join(root, "scripts/configure.mjs"), "--max-depth", "2"], {
+    env: { ...f.env, HOME: f.dir, USERPROFILE: f.dir }, encoding: "utf8",
+  });
+  assert.equal(run.status, 0, run.stderr);
+  assert.equal(readJson(f.file).max_depth, 2);
+  assert.equal(fs.existsSync(path.join(f.dir, ".gemini")), false);
+});
 
 test("configurator applies presets then overrides, replaces atomically and reports effective status", (t) => {
   const f = fixture(t), cli = configurator(f);

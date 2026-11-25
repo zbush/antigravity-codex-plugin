@@ -16,6 +16,7 @@ import {
   MAX_RECENT_EVENTS,
   MAX_STDERR_CHARS,
   clampTimeoutMs,
+  configuredFile,
   findWindowsCommand,
   createJobRegistry,
   terminateProcessTree,
@@ -38,8 +39,8 @@ const LAUNCH_TOOL_NAMES = new Set([
 const registry = createJobRegistry();
 
 export function resolveCodexInvocation(codexArgs, env = process.env) {
-  const configuredBin = env.CODEX_BIN;
-  if (configuredBin && fs.existsSync(configuredBin)) {
+  const configuredBin = configuredFile(env.CODEX_BIN, "CODEX_BIN");
+  if (configuredBin) {
     if (process.platform === "win32" && /\.(cmd|bat)$/i.test(configuredBin)) {
       return windowsBatchInvocation(configuredBin, codexArgs);
     }
@@ -50,8 +51,8 @@ export function resolveCodexInvocation(codexArgs, env = process.env) {
     };
   }
 
-  const configuredJs = env.CODEX_CLI_JS;
-  if (configuredJs && fs.existsSync(configuredJs)) {
+  const configuredJs = configuredFile(env.CODEX_CLI_JS, "CODEX_CLI_JS");
+  if (configuredJs) {
     return {
       command: process.execPath,
       args: [configuredJs, ...codexArgs],
@@ -76,7 +77,7 @@ export function resolveCodexInvocation(codexArgs, env = process.env) {
   ];
 
   for (const candidate of candidateJsPaths) {
-    if (fs.existsSync(candidate)) {
+    if (path.isAbsolute(candidate) && fs.statSync(candidate, { throwIfNoEntry: false })?.isFile()) {
       return {
         command: process.execPath,
         args: [candidate, ...codexArgs],

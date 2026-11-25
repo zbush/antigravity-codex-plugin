@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveCodexInvocation } from "../server/codex-mcp.mjs";
-import { BRIDGE_ENV_VARS, getDefaultUserConfigPath, loadBridgeConfig } from "../server/lib/bridge.mjs";
+import { BRIDGE_ENV_VARS, resolvePolicyPath, loadBridgeConfig } from "../server/lib/bridge.mjs";
 
 const serverName = "antigravity-local";
 const serverPath = fileURLToPath(new URL("../server/antigravity-mcp.mjs", import.meta.url));
@@ -112,6 +112,7 @@ function configurePolicy(file, opts) {
     const env = { ...process.env };
     if (opts.config) delete env.AGENT_BRIDGE_CONFIG;
     const { config, userConfigPath } = loadBridgeConfig(env, file);
+    if (env.AGENT_BRIDGE_INHERITED_POLICY) console.log("The inherited delegation ceiling applies to this status.");
     console.log("Effective policy (" + userConfigPath + "): " + JSON.stringify(config, null, 2));
   }
 }
@@ -249,7 +250,7 @@ function configureRegistration(opts) {
 function main() {
   const opts = parseOptions(process.argv.slice(2));
   if (opts.help || process.argv.length === 2) return console.log(usage);
-  const file = opts.config || getDefaultUserConfigPath();
+  const file = resolvePolicyPath(opts.config ?? process.env.AGENT_BRIDGE_CONFIG);
   try { configurePolicy(file, opts); } catch (err) {
     console.error("Bridge config error (" + file + "): " + err.message);
     process.exitCode = 1;

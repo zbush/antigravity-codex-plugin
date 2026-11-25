@@ -75,7 +75,7 @@ This immediately enables **Direction A (Antigravity → Codex)** in Antigravity 
 
 ### 2. Wire Direction B (Codex → Antigravity) *(optional)*
 
-Run the built-in configurator from the plugin directory to register `antigravity-local` in Codex (`~/.codex/config.toml`), configure `env_vars` forwarding for the loop guard, and choose your starting mode:
+Run the built-in configurator from the installed plugin checkout to register `antigravity-local` in Codex (`~/.codex/config.toml`), configure `env_vars` forwarding for the loop guard, and choose your starting mode. If you wired Codex on an older version, rerun `node scripts/configure.mjs --wire-codex` from that checkout and then restart the host for the updated `AGENT_BRIDGE_INHERITED_POLICY` pass-through.
 
 ```bash
 cd ~/.gemini/config/plugins/codex
@@ -105,6 +105,7 @@ env_vars = [
   "AGENT_BRIDGE_MAX_DEPTH",
   "AGENT_BRIDGE_CHAIN",
   "AGENT_BRIDGE_CONFIG",
+  "AGENT_BRIDGE_INHERITED_POLICY",
   "AGENT_BRIDGE_ANTIGRAVITY_TO_CODEX",
   "AGENT_BRIDGE_CODEX_TO_ANTIGRAVITY",
   "AGENT_BRIDGE_ALLOW_CYCLES",
@@ -130,7 +131,9 @@ User policy is stored outside the plugin install folder so `git pull` or plugin 
 - **Default user policy file**: `~/.gemini/config/antigravity-codex-bridge/bridge.config.json`
 - **Shipped defaults**: `./bridge.config.json` (`antigravity_to_codex: true`, `codex_to_antigravity: false`, `max_depth: 1`, `allow_cycles: false`)
 
-Effective policy is re-read live on every `tools/list` and `tools/call` with precedence:
+When you supply a config path via `AGENT_BRIDGE_CONFIG` or `--config`, that path must be absolute and nonblank. Passing `--config` to `scripts/configure.mjs` selects its target file ahead of `AGENT_BRIDGE_CONFIG`. At runtime, an explicit config path pointing to a missing file fails closed.
+
+Both servers reload the operator config live on every `tools/list` and `tools/call` in the precedence order below. On delegated hops, the child intersects that operator config with `AGENT_BRIDGE_INHERITED_POLICY` before admitting a handoff.
 
 ```text
 Environment variables  >  User bridge.config.json (or AGENT_BRIDGE_CONFIG)  >  Shipped bridge.config.json  >  Built-in defaults
@@ -175,17 +178,17 @@ node scripts/configure.mjs --mode bidirectional --max-depth 4 --allow-cycles on
 ### How live policy & loop guards work
 
 1. **Disabled direction**: The server still responds to `initialize` and `ping`, returns an empty `tools: []` list (emitting `notifications/tools/list_changed` if disabled live), cancels owned jobs, and rejects any cached `tools/call` with JSON-RPC error `-32602` (`data.reason: "direction_disabled"`).
-2. **Depth & cycle tracking**: Every delegated launch propagates a fresh child environment with incremented `AGENT_BRIDGE_DEPTH`, `AGENT_BRIDGE_MAX_DEPTH`, and `AGENT_BRIDGE_CHAIN` (JSON array of directed hops):
+2. **Depth, cycles, and inherited limits.** Each parent forwards the incremented `AGENT_BRIDGE_DEPTH`, the updated `AGENT_BRIDGE_CHAIN`, and its effective policy in `AGENT_BRIDGE_INHERITED_POLICY`. A child can use a direction only when both inherited and current operator settings enable it. The lower `max_depth` applies, and both policies must permit cycles.
    - `depth = 0` is a top-level user session.
    - When `depth >= max_depth`, launch tools (`*_run`, `*_spawn`, `*_resume`, `*_fork`, `*_review`) are hidden and rejected (`data.reason: "max_depth_reached"`), while `*_job_status` and `*_job_cancel` remain available.
    - When `allow_cycles` is `false` (default), repeating a direction already present in `AGENT_BRIDGE_CHAIN` is blocked (`data.reason: "cycle_blocked"`), allowing `A → B → A` at `max_depth: 2` while preventing ping-pong loops. Set `allow_cycles: true` with a bounded `max_depth` if you want deeper back-and-forth chains.
-3. **Fail-closed validation**: Malformed JSON, invalid values, missing explicit `AGENT_BRIDGE_CONFIG` files, or inconsistent `AGENT_BRIDGE_DEPTH`/`AGENT_BRIDGE_CHAIN` fail closed instead of silently bypassing guards.
+3. **Fail-closed validation.** A nonzero `AGENT_BRIDGE_DEPTH` without `AGENT_BRIDGE_INHERITED_POLICY` refuses the launch. The bridge also fails closed on malformed JSON, invalid policy values, blank or relative `AGENT_BRIDGE_CONFIG` paths, missing explicit `AGENT_BRIDGE_CONFIG` files at runtime, and inconsistent `AGENT_BRIDGE_DEPTH` and `AGENT_BRIDGE_CHAIN` values.
 
 ### Environment variable overrides
 
 | Variable | Values | Purpose |
 | :--- | :--- | :--- |
-| `AGENT_BRIDGE_CONFIG` | Absolute file path | Shared override path for `bridge.config.json`. |
+| `AGENT_BRIDGE_CONFIG` | Nonblank absolute file path | Shared override path for runtime and `scripts/configure.mjs`. Missing explicit files fail closed at runtime, and `--config` selects the configurator target ahead of this variable. |
 | `AGENT_BRIDGE_ANTIGRAVITY_TO_CODEX` | `true` / `false` (`on`/`off`) | Override Antigravity → Codex direction. |
 | `AGENT_BRIDGE_CODEX_TO_ANTIGRAVITY` | `true` / `false` (`on`/`off`) | Override Codex → Antigravity direction. |
 | `AGENT_BRIDGE_MAX_DEPTH` | Integer `0..10` | Maximum delegated hop depth. |
@@ -225,7 +228,7 @@ node scripts/configure.mjs --mode bidirectional --max-depth 4 --allow-cycles on
 
 By default, `mcp_config.json` uses portable defaults (`command: "node"`, `args: ["server/index.mjs"]`) because Antigravity runs plugin MCP servers with `cwd` set to the plugin root.
 
-If a desktop/GUI host doesn't inherit your shell `PATH`, pin explicit paths in your local `~/.gemini/config/plugins/codex/mcp_config.json`:
+On Windows, automatic discovery checks `%LOCALAPPDATA%\agy\bin\agy.exe` and `PATH` for `agy`, and resolves `codex` from `PATH` (including `.cmd` shims). Setting `CODEX_CLI_JS` runs `@openai/codex/bin/codex.js` directly through Node and skips `.cmd` shim lookup. When a desktop or GUI host omits your shell `PATH`, pin explicit paths in your local `~/.gemini/config/plugins/codex/mcp_config.json` as shown below.
 
 <details>
 <summary><strong>Windows example (nvm-windows)</strong></summary>

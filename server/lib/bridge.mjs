@@ -19,6 +19,7 @@ export const BRIDGE_ENV_VARS = Object.freeze([
   "AGENT_BRIDGE_MAX_DEPTH",
   "AGENT_BRIDGE_CHAIN",
   "AGENT_BRIDGE_CONFIG",
+  "AGENT_BRIDGE_INHERITED_POLICY",
   "AGENT_BRIDGE_ANTIGRAVITY_TO_CODEX",
   "AGENT_BRIDGE_CODEX_TO_ANTIGRAVITY",
   "AGENT_BRIDGE_ALLOW_CYCLES",
@@ -45,6 +46,13 @@ export function getDefaultUserConfigPath() {
     "antigravity-codex-bridge",
     "bridge.config.json"
   );
+}
+
+export function resolvePolicyPath(selected, fallback = getDefaultUserConfigPath()) {
+  const file = selected?.trim();
+  if (selected !== undefined && !file) throw new Error("Bridge config path must not be blank.");
+  if (file && !path.isAbsolute(file)) throw new Error("Bridge config requires an absolute path: " + file);
+  return file || fallback;
 }
 
 function parseBoolEnv(raw, varName) {
@@ -154,10 +162,7 @@ export function loadBridgeConfig(env = process.env, defaultUserPath = getDefault
   }
 
   const explicitConfigPath = env.AGENT_BRIDGE_CONFIG?.trim();
-  const userConfigPath = explicitConfigPath || defaultUserPath;
-  if (explicitConfigPath && !path.isAbsolute(explicitConfigPath)) {
-    throw new Error(`AGENT_BRIDGE_CONFIG must be an absolute path: "${explicitConfigPath}"`);
-  }
+  const userConfigPath = resolvePolicyPath(explicitConfigPath, defaultUserPath);
 
   const userLayer = readJsonFileStrict(userConfigPath, Boolean(explicitConfigPath));
   if (userLayer) {
@@ -189,6 +194,20 @@ export function loadBridgeConfig(env = process.env, defaultUserPath = getDefault
   const allowCyclesEnv = parseBoolEnv(env.AGENT_BRIDGE_ALLOW_CYCLES, "AGENT_BRIDGE_ALLOW_CYCLES");
   if (allowCyclesEnv !== undefined) {
     config.allow_cycles = allowCyclesEnv;
+  }
+
+  // A parent may narrow a child's authority. Current operator policy still applies.
+  if (env.AGENT_BRIDGE_INHERITED_POLICY !== undefined) {
+    const inherited = JSON.parse(env.AGENT_BRIDGE_INHERITED_POLICY);
+    if (inherited?.version !== 1 || !Number.isInteger(inherited.max_depth) ||
+        typeof inherited.allow_cycles !== "boolean" ||
+        !Object.values(DIRECTIONS).every(key => typeof inherited.directions?.[key] === "boolean")) {
+      throw new Error("Malformed AGENT_BRIDGE_INHERITED_POLICY.");
+    }
+    const ceiling = mergeConfigLayer(config, inherited, "AGENT_BRIDGE_INHERITED_POLICY");
+    for (const key of Object.values(DIRECTIONS)) config.directions[key] &&= ceiling.directions[key];
+    config.max_depth = Math.min(config.max_depth, ceiling.max_depth);
+    config.allow_cycles &&= ceiling.allow_cycles;
   }
 
   return {
@@ -297,6 +316,12 @@ export function evaluateDelegationPolicy(direction, env = process.env) {
     };
   }
 
+  if (context.depth > 0 && env.AGENT_BRIDGE_INHERITED_POLICY === undefined) {
+    return {
+      allowed: false, directionEnabled: true, reason: "invalid_config", config, context,
+      message: "Nested delegation requires AGENT_BRIDGE_INHERITED_POLICY. Run node scripts/configure.mjs --wire-codex, then restart the host.",
+    };
+  }
   if (context.depth >= config.max_depth) {
     return {
       allowed: false,
@@ -340,11 +365,8 @@ export function buildChildBridgeEnv(direction, evaluation, baseEnv = process.env
   const childEnv = {
     ...baseEnv,
     AGENT_BRIDGE_DEPTH: String(nextDepth),
-    AGENT_BRIDGE_MAX_DEPTH: String(evaluation.config.max_depth),
     AGENT_BRIDGE_CHAIN: JSON.stringify(nextChain),
-    AGENT_BRIDGE_ANTIGRAVITY_TO_CODEX: String(evaluation.config.directions.antigravity_to_codex),
-    AGENT_BRIDGE_CODEX_TO_ANTIGRAVITY: String(evaluation.config.directions.codex_to_antigravity),
-    AGENT_BRIDGE_ALLOW_CYCLES: String(evaluation.config.allow_cycles),
+    AGENT_BRIDGE_INHERITED_POLICY: JSON.stringify(evaluation.config),
   };
 
   if (evaluation.userConfigPath && fs.existsSync(evaluation.userConfigPath)) {

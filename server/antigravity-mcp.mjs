@@ -8,7 +8,7 @@ import { pathToFileURL } from "node:url";
 import { buildChildBridgeEnv, DIRECTIONS, evaluateDelegationPolicy } from "./lib/bridge.mjs";
 import { createRpcError, startMcpStdioServer } from "./lib/mcp.mjs";
 import {
-  createJobRegistry, DEFAULT_TIMEOUT_SECONDS, findWindowsCommand, MAX_RECENT_EVENTS,
+  configuredFile, createJobRegistry, DEFAULT_TIMEOUT_SECONDS, findWindowsCommand, MAX_RECENT_EVENTS,
   MAX_STDERR_CHARS, MAX_TIMEOUT_SECONDS, terminateProcessTree, validateAbsoluteDir,
   windowsBatchInvocation,
 } from "./lib/process.mjs";
@@ -24,8 +24,8 @@ export function resolveAgyInvocation(agyArgs, env = process.env) {
     path.join(env.HOME || os.homedir(), ".local", "bin", "agy"),
     "/opt/homebrew/bin/agy", "/usr/local/bin/agy",
   ];
-  const found = [env.AGY_BIN, ...defaults].find(
-    (file) => file && fs.statSync(file, { throwIfNoEntry: false })?.isFile()
+  const found = configuredFile(env.AGY_BIN, "AGY_BIN") || defaults.find(
+    (file) => file && path.isAbsolute(file) && fs.statSync(file, { throwIfNoEntry: false })?.isFile()
   );
   const command = found ? path.resolve(found) : windows ? findWindowsCommand("agy", env) : "agy";
   if (windows && /\.(cmd|bat)$/i.test(command)) return windowsBatchInvocation(command, agyArgs);
