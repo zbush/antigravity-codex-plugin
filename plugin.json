@@ -1,0 +1,21 @@
+{
+  "name": "codex",
+  "displayName": "Local Codex Orchestrator",
+  "version": "1.0.0",
+  "logo": "assets/logo.png",
+  "author": {
+    "name": "zbush",
+    "url": "https://github.com/zbush"
+  },
+  "homepage": "https://github.com/zbush/antigravity-codex-plugin",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zbush/antigravity-codex-plugin"
+  },
+  "description": "Orchestrate local OpenAI Codex CLI agents via a bundled zero-dependency MCP server: run tasks, resume or fork sessions, perform code reviews, and manage parallel background Codex workers.",
+  "suggestedPrompts": [
+    "Ask local Codex to review my uncommitted git changes",
+    "Delegate a scoped implementation task to a local Codex agent in a git worktree",
+    "Spawn parallel local Codex agents to investigate two modules and summarize their findings"
+  ]
+}
