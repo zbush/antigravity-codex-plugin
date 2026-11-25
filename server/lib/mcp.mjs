@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import readline from "node:readline";
 
 const DEFAULT_PROTOCOL_VERSION = "2024-11-05";
@@ -19,6 +20,13 @@ export function startMcpStdioServer({
   callTool,
   onShutdown,
 }) {
+  const serverInfo = { name: serverName, version: serverVersion };
+  try {
+    const icon = readFileSync(new URL("../../assets/icon-64.png", import.meta.url), "base64");
+    serverInfo.icons = [{ src: "data:image/png;base64," + icon, mimeType: "image/png", sizes: ["64x64"] }];
+  } catch {
+    // A server-only installation can initialize without the optional artwork.
+  }
   let initialized = false;
   let lastToolNamesKey = null;
   let inFlightRequests = 0;
@@ -68,7 +76,7 @@ export function startMcpStdioServer({
         sendResult(id, {
           protocolVersion: requestedVersion,
           capabilities: { tools: { listChanged: true } },
-          serverInfo: { name: serverName, version: serverVersion },
+          serverInfo,
         });
         return;
       }
