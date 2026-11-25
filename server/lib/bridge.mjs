@@ -17,6 +17,9 @@ export const VALID_DIRECTIONS = new Set(Object.values(DIRECTIONS));
 
 export const BRIDGE_ENV_VARS = Object.freeze([
   "AGENT_BRIDGE_CONTEXT",
+  "AGENT_BRIDGE_WORKSPACE_ROOTS",
+  "AGENT_BRIDGE_ALLOW_EDITS",
+  "AGENT_BRIDGE_CODEX_WINDOWS_SANDBOX",
   "AGENT_BRIDGE_DEPTH",
   "AGENT_BRIDGE_MAX_DEPTH",
   "AGENT_BRIDGE_CHAIN",
@@ -401,24 +404,6 @@ export function buildChildBridgeEnv(direction, evaluation, baseEnv = process.env
     nextDepth,
     nextChain,
   };
-}
-
-/**
- * Check whether Codex's user config.toml declares `[mcp_servers.antigravity-local]`.
- * Only when present should we pass per-invocation `-c mcp_servers.antigravity-local.env_vars=...`.
- */
-export function hasCodexAntigravityMcpConfigured(env = process.env) {
-  const codexHome = env.CODEX_HOME?.trim() || path.join(os.homedir(), ".codex");
-  const configPath = path.join(codexHome, "config.toml");
-  if (!fs.existsSync(configPath)) return false;
-  try {
-    const raw = fs.readFileSync(configPath, "utf8");
-    return /^\s*\[mcp_servers\.(?:"antigravity-local"|'antigravity-local'|antigravity-local)\]/m.test(
-      raw
-    );
-  } catch {
-    return false;
-  }
 }
 
 export function getCodexEnvVarsOverrideArg() {

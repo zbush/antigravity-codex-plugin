@@ -12,7 +12,7 @@ description: >-
 The `codex-local` MCP server wraps the locally installed `@openai/codex` CLI
 (`codex exec`, `codex exec resume`, `codex exec fork`, and `codex exec review`)
 so you can delegate bounded tasks and coordinate parallel Codex workers using
-the user's existing local Codex auth and `~/.codex/config.toml`.
+the user's existing local Codex sign-in and the bridge's launch settings.
 
 This plugin also ships the reverse MCP server (`antigravity-local`) so Codex can
 delegate back to Antigravity CLI (`agy`) when enabled by the user. Both
@@ -36,9 +36,8 @@ automatically via `AGENT_BRIDGE_*` environment variables.
 2. **Use `codex_spawn` for deep research or multi-file implementation.** MCP host tool calls may time out after ~3 minutes; `codex_spawn` returns a `job_id` immediately so long-running Codex jobs complete safely in the background.
 3. **Choose the narrowest `sandbox` mode needed:**
    - Use `sandbox: "read-only"` for codebase exploration, architecture audits, bug triage, and second opinions.
-   - Use `sandbox: "workspace-write"` for implementation, refactoring, and test fixes.
-   - Avoid `danger-full-access` unless the user explicitly asks for it.
-4. **Isolate parallel writers with `worktree: true`.** When spawning multiple Codex agents that edit files in the same Git repository at the same time, pass `worktree: true` so their edits do not collide on the working tree.
+   - Request `sandbox: "workspace-write"` for edits only when the operator enabled `AGENT_BRIDGE_ALLOW_EDITS=true`.
+4. **Isolate parallel writers.** Give each worker a separate prepared worktree under an approved workspace root. Pass that worktree as `cwd`.
 5. **Write self-contained briefs.** Codex runs in its own fresh context and does not see this conversation. Include:
    - Concrete goal and scope (exact files/modules to inspect or change)
    - Constraints and conventions to follow

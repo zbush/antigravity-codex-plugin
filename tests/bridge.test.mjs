@@ -58,12 +58,13 @@ async function mockAgy() {
 }
 
 async function mockCodex() {
-  if (process.argv[2] !== "exec") throw new Error("Expected codex exec");
+  if (!process.argv.includes("exec")) throw new Error("Expected codex exec");
   let prompt = "";
   for await (const chunk of process.stdin) prompt += chunk;
   const context = {
     depth: process.env.AGENT_BRIDGE_DEPTH, chain: process.env.AGENT_BRIDGE_CHAIN,
     maxDepth: JSON.parse(process.env.AGENT_BRIDGE_INHERITED_POLICY).max_depth, prompt,
+    args: process.argv.slice(2), allowEdits: process.env.AGENT_BRIDGE_ALLOW_EDITS,
   };
   console.log(JSON.stringify({ type: "thread.started", thread_id: "codex-id" }));
   console.log(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify(context) } }));
@@ -82,6 +83,7 @@ function fixture(t) {
   }
   Object.assign(env, {
     CODEX_HOME: codexHome, AGENT_BRIDGE_CONFIG: file,
+    AGENT_BRIDGE_WORKSPACE_ROOTS: JSON.stringify([dir]), AGENT_BRIDGE_ALLOW_EDITS: "true",
     AGY_BIN: path.join(dir, "mock agy.cjs"), CODEX_CLI_JS: path.join(dir, "mock codex.cjs"),
   });
   fs.writeFileSync(env.AGY_BIN, "(" + mockAgy.toString() + ")();");
@@ -276,8 +278,8 @@ for (const [name, direction, incoming] of [["codex", forward, reverse], ["antigr
     } else {
       assert.deepEqual(context.message, { event: "user", message: { content: args.prompt } });
       assert.deepEqual(context.args, ["--input-format", "stream-json", "--output-format", "stream-json",
-        "--sandbox", "--disable-slash-commands", "--print-timeout", "600s"]);
-      assert.equal(context.cwd, f.dir);
+        "--mode", "plan", "--sandbox", "--disable-slash-commands", "--print-timeout", "600s"]);
+      assert.equal(context.cwd, fs.realpathSync.native(f.dir));
     }
     writeJson(f.file, { ...policy, max_depth: 1 });
     assert.deepEqual(await client.tools(), inspect);
@@ -292,26 +294,63 @@ for (const [name, direction, incoming] of [["codex", forward, reverse], ["antigr
   });
 }
 
+test("launches enforce operator roots, edit permissions and bounded session reuse", async t => {
+  const f = fixture(t);
+  const safe = f.connect("codex", { AGENT_BRIDGE_ALLOW_EDITS: "false" });
+  const args = { cwd: f.dir, prompt: "test" };
+  const deny = async (client, tool, values) => assert.equal((await client.call(tool, values)).error.code, -32602);
+  for (const override of [{ sandbox: "workspace-write" }, { sandbox: "danger-full-access" }, { worktree: true },
+    { profile: "extra" }, { cwd: path.dirname(f.dir) }, { add_dirs: [path.dirname(f.dir)] }]) {
+    await deny(safe, "codex_run", { ...args, ...override });
+  }
+  await deny(safe, "codex_fork", { ...args, session_id: "unknown" });
+  const verify = (job, sandbox) => {
+    const record = JSON.parse(job.response);
+    assert.equal(record.args[record.args.indexOf("-s") + 1], sandbox);
+    assert.equal(record.args[record.args.indexOf("-a") + 1], "never");
+    assert.ok(record.args.includes("--ignore-user-config"));
+    assert.equal(record.allowEdits, String(sandbox === "workspace-write"));
+  };
+  const run = payload(await safe.call("codex_run", args));
+  verify(run, "read-only");
+  verify(payload(await safe.call("codex_resume", { ...args, session_id: run.session_id })), "read-only");
+  verify(payload(await safe.call("codex_review", args)), "read-only");
+  const editing = f.connect("codex");
+  verify(payload(await editing.call("codex_run", { ...args, sandbox: "workspace-write" })), "workspace-write");
+  await deny(f.connect("antigravity", { AGENT_BRIDGE_ALLOW_EDITS: "false" }), "antigravity_spawn", args);
+});
+
+test("Windows delegates receive only an operator-selected sandbox backend", { skip: process.platform !== "win32" }, async t => {
+  const f = fixture(t);
+  const args = { cwd: f.dir, prompt: "test" };
+  const selected = f.connect("codex", { AGENT_BRIDGE_CODEX_WINDOWS_SANDBOX: "elevated" });
+  const record = JSON.parse(payload(await selected.call("codex_run", args)).response);
+  assert.ok(record.args.includes('windows.sandbox="elevated"'));
+  const invalid = f.connect("codex", { AGENT_BRIDGE_CODEX_WINDOWS_SANDBOX: "unknown" });
+  const denied = await invalid.call("codex_run", args);
+  assert.match(denied.error.message, /Invalid AGENT_BRIDGE_CODEX_WINDOWS_SANDBOX/);
+});
+
 test("Antigravity maps launch flags and requires a successful terminal result and exit", async (t) => {
   const f = fixture(t);
   const client = f.connect("antigravity");
   const call = (params) => client.call("antigravity_run", { cwd: f.dir, prompt: "test", ...params });
   const schema = { type: "object", description: 'some "text" & a %VARIABLE%' };
   const result = payload(await call({
-    resume: { conversation_id: "old-id" }, model: "test model", effort: "high", agent: "local", mode: "fast",
-    sandbox: false, disable_slash_commands: false, add_dirs: [f.dir, f.codexHome], json_schema: schema, timeout_seconds: 25,
+    model: "test model", effort: "high", mode: "accept-edits",
+    add_dirs: [f.dir, f.codexHome], json_schema: schema, timeout_seconds: 25,
   }));
   assert.deepEqual(result.structured_output.args, [
-    "--input-format", "stream-json", "--output-format", "stream-json", "--conversation", "old-id", "--model", "test model",
-    "--agent", "local", "--effort", "high", "--mode", "fast", "--add-dir", f.dir, "--add-dir", f.codexHome,
+    "--input-format", "stream-json", "--output-format", "stream-json", "--model", "test model",
+    "--effort", "high", "--mode", "accept-edits", "--add-dir", fs.realpathSync.native(f.dir), "--add-dir", fs.realpathSync.native(f.codexHome),
+    "--sandbox", "--disable-slash-commands",
     "--json-schema", JSON.stringify(schema), "--print-timeout", "25s",
   ]);
   assert.equal(result.conversation_id, "agy-id");
   assert.equal(result.response, "final answer");
   assert.deepEqual(result.usage, { total_tokens: 12 });
   assert.deepEqual(result.recent_events.map((e) => e.event), ["init", "step_update", "step_update", "result"]);
-  assert.ok(payload(await call({ resume: { continue_last: true } })).structured_output.args.includes("--continue"));
-  for (const params of [{ resume: {} }, { resume: { conversation_id: "id", continue_last: true } },
+  for (const params of [{ resume: {} }, { resume: { continue_last: true } }, { agent: "override" }, { sandbox: false }, { disable_slash_commands: false },
     { add_dirs: ["relative"] }, { sandbox: "false" }, { timeout_seconds: -2 }, { json_schema: [] }]) {
     assert.equal((await call(params)).error.code, -32602);
   }
@@ -457,6 +496,28 @@ function configurator(f) {
     return run.stdout + run.stderr;
   };
 }
+
+test("isolated Codex runs reconstruct only the enabled standard peer registration", async t => {
+  const f = fixture(t);
+  const cfg = configurator(f);
+  cfg(["--wire-codex"]);
+  fs.writeFileSync(f.env.CODEX_CLI_JS, "process.argv[2] === 'mcp' ? (" + mockRegistration.toString() + ")() : (" + mockCodex.toString() + ")();");
+  const client = f.connect("codex");
+  const peerIsPresent = async () => {
+    const job = payload(await client.call("codex_run", { cwd: f.dir, prompt: "fixture" }));
+    return JSON.parse(job.response).args.some(arg => arg.startsWith("mcp_servers.antigravity-local.command="));
+  };
+  assert.equal(await peerIsPresent(), true);
+  const meta = path.join(f.codexHome, "registration.json");
+  const info = readJson(meta);
+  writeJson(meta, { ...info, enabled: false });
+  assert.equal(await peerIsPresent(), false);
+  writeJson(meta, { ...info, transport: { ...info.transport, args: ["some-other-server"] } });
+  assert.equal(await peerIsPresent(), false);
+  writeJson(meta, info);
+  fs.appendFileSync(path.join(f.codexHome, "config.toml"), "\n[mcp_servers.antigravity-local.tools.antigravity_spawn]\napproval_mode = 'ask'\n");
+  assert.equal(await peerIsPresent(), false);
+});
 
 test("configurator edits the runtime environment-selected file", t => {
   const f = fixture(t);

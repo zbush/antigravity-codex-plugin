@@ -6,7 +6,7 @@
 
 A zero-dependency, **bidirectional** Model Context Protocol (MCP) plugin that lets **Google Antigravity** and **OpenAI Codex CLI** delegate work to each other—either in a strict master/worker hierarchy or freely back and forth as peers with built-in recursion and cycle protection.
 
-- **Antigravity → Codex (`codex-local`)**: Antigravity delegates scoped implementation, code review, or parallel Git worktree tasks to your local `@openai/codex` CLI (`codex exec --json`, `resume`, `fork`, `review`).
+- **Antigravity → Codex (`codex-local`)**: Antigravity delegates scoped implementation, code review, or parallel tasks in operator-approved workspaces to your local `@openai/codex` CLI (`codex exec --json`, `resume`, `fork`, `review`).
 - **Codex → Antigravity (`antigravity-local`)**: Codex delegates research, planning, editing, or structured-output tasks to your local Google Antigravity CLI (`agy --input-format stream-json --output-format stream-json`).
 - **Independent direction controls**: Enable or disable either direction independently with a single shared policy file (`bridge.config.json`), CLI configurator (`scripts/configure.mjs`), or environment variables—no restart required.
 
@@ -106,6 +106,9 @@ env_vars = [
   "AGENT_BRIDGE_CHAIN",
   "AGENT_BRIDGE_CONFIG",
   "AGENT_BRIDGE_CONTEXT",
+  "AGENT_BRIDGE_WORKSPACE_ROOTS",
+  "AGENT_BRIDGE_ALLOW_EDITS",
+  "AGENT_BRIDGE_CODEX_WINDOWS_SANDBOX",
   "AGENT_BRIDGE_INHERITED_POLICY",
   "AGENT_BRIDGE_ANTIGRAVITY_TO_CODEX",
   "AGENT_BRIDGE_CODEX_TO_ANTIGRAVITY",
@@ -187,7 +190,7 @@ node scripts/configure.mjs --mode bidirectional --max-depth 4 --allow-cycles on
 
 ### Environment variable overrides
 
-Updated bridges pass `AGENT_BRIDGE_CONTEXT` through the host environment. Its version 1 JSON object contains ordered `hops` with `from`, `to` and a unique `id`, plus `remaining_hops`. Each handoff spends one hop and applies the smaller of the incoming budget and the local limit. A handoff entering from the Claude bridge can start this pair's local policy history. A returning handoff that previously used this pair must still carry its inherited policy. Refresh existing Codex forwarding with `node scripts/configure.mjs --wire-codex`.
+Updated bridges pass `AGENT_BRIDGE_CONTEXT` through the host environment as a version 1 JSON object containing ordered `hops` (`from`, `to`, and a unique `id`) and `remaining_hops`. Each handoff spends one hop and applies the smaller of the incoming budget and the local limit. A handoff entering from the Claude bridge can start this pair's local policy history. A returning handoff that previously used this pair must carry its inherited policy. Run `node scripts/configure.mjs --wire-codex` to refresh existing Codex forwarding.
 
 | Variable | Values | Purpose |
 | :--- | :--- | :--- |
@@ -198,9 +201,18 @@ Updated bridges pass `AGENT_BRIDGE_CONTEXT` through the host environment. Its ve
 | `AGENT_BRIDGE_ALLOW_CYCLES` | `true` / `false` (`on`/`off`) | Allow repeating a direction in the same chain up to `max_depth`. |
 | `CODEX_BIN` | File path | Explicit `codex` binary or `.cmd` shim path. |
 | `CODEX_CLI_JS` | File path | Explicit `@openai/codex/bin/codex.js` path (run via `process.execPath`). |
+| `AGENT_BRIDGE_CODEX_WINDOWS_SANDBOX` | `mxc`, `elevated`, `unelevated` | Select the Windows sandbox backend provisioned on this machine. Use the value of `windows.sandbox` in the operator's Codex configuration when the delegated CLI needs it for shell commands. |
 | `AGY_BIN` | File path | Explicit `agy` executable path (defaults auto-check `%LOCALAPPDATA%\agy\bin\agy.exe`, `~/.local/bin/agy`, Homebrew, and `PATH`). |
 
 ---
+
+### Workspace and edit permissions
+
+Set `AGENT_BRIDGE_WORKSPACE_ROOTS` in each host's MCP registration to a JSON array of absolute directories, for example `["/home/me/projects"]`. The bridge resolves symlinks and checks `cwd` and every `add_dirs` entry against those roots before launch. If the setting is absent, the server uses its startup directory. A server started at a volume root requires explicit roots.
+
+Codex starts read-only. To request `workspace-write`, the operator must set `AGENT_BRIDGE_ALLOW_EDITS` to the string `true`. The isolated CLI loads the paired Antigravity server when a return hop is available and the standard registration from `--wire-codex` is enabled. It skips customized registrations with additional tool, approval, or environment settings. Its callback inherits the selected directories and edit setting. For parallel edits, prepare separate worktrees inside approved roots and pass each as `cwd`.
+
+Antigravity CLI tasks require `AGENT_BRIDGE_ALLOW_EDITS=true` because the CLI can edit files even when asked to plan. Each task starts a fresh sandboxed session with slash commands disabled, in `plan` mode unless the caller selects `accept-edits`. The workspace check controls launch directories. The provider enforces file and command permissions during execution.
 
 ## MCP Tool Reference
 
@@ -208,9 +220,9 @@ Updated bridges pass `AGENT_BRIDGE_CONTEXT` through the host environment. Its ve
 
 | Tool | Description |
 | :--- | :--- |
-| `codex_run` | Run a scoped local Codex task synchronously (`prompt`, `cwd`, `sandbox`, `model`, `profile`, `worktree`, `add_dirs`, `skip_git_repo_check`, `ephemeral`, `timeout_seconds`) and return `session_id`, response, commands run, and token usage. |
-| `codex_resume` | Continue an existing Codex thread by `session_id` (or `last: true`). |
-| `codex_fork` | Fork an existing Codex session into a new independent thread. |
+| `codex_run` | Run a scoped local Codex task synchronously (`prompt`, `cwd`, `sandbox`, `model`, `add_dirs`, `skip_git_repo_check`, `ephemeral`, `timeout_seconds`) and return `session_id`, response, commands run, and token usage. |
+| `codex_resume` | Continue a completed session started by this bridge in the same workspace. Use its `session_id` or select the latest owned session with `last: true`. |
+| `codex_fork` | Fork a completed session started by this bridge in the same workspace. |
 | `codex_review` | Run a non-interactive code review against uncommitted changes, a `base` branch, or a `commit` SHA. |
 | `codex_spawn` | Start a Codex task (`run`/`resume`/`fork`/`review`) in the background and return a `job_id` immediately (recommended for parallel workers or tasks > ~2 minutes). |
 | `codex_job_status` | Inspect a background `job_id` or list all tracked Codex jobs. |
@@ -220,7 +232,7 @@ Updated bridges pass `AGENT_BRIDGE_CONTEXT` through the host environment. Its ve
 
 | Tool | Description |
 | :--- | :--- |
-| `antigravity_run` | Run a local Antigravity CLI turn synchronously (`prompt`, `cwd`, optional `resume: { conversation_id }` or `resume: { continue_last: true }`, `model`, `agent`, `effort`, `mode`, `add_dirs`, `sandbox`, `disable_slash_commands`, `json_schema`, `timeout_seconds`) and return `conversation_id`, response, `structured_output`, and token usage. |
+| `antigravity_run` | Run a local Antigravity CLI turn synchronously (`prompt`, `cwd`, `model`, `effort`, `mode`, `add_dirs`, `sandbox`, `disable_slash_commands`, `json_schema`, `timeout_seconds`) and return `conversation_id`, response, `structured_output`, and token usage. |
 | `antigravity_spawn` | Start a background Antigravity turn and return a `job_id` immediately for parallel fan-out or long tasks. |
 | `antigravity_job_status` | Inspect a background `job_id` or list all tracked Antigravity jobs. |
 | `antigravity_job_cancel` | Terminate a running background Antigravity job and its process tree. |
