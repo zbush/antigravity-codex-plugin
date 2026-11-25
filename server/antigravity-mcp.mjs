@@ -7,9 +7,10 @@ import readline from "node:readline";
 import { pathToFileURL } from "node:url";
 import { buildChildBridgeEnv, DIRECTIONS, evaluateDelegationPolicy } from "./lib/bridge.mjs";
 import { createRpcError, startMcpStdioServer } from "./lib/mcp.mjs";
+import { loadWorkspacePolicy, resolveWorkspaceDir } from "./lib/workspace-policy.mjs";
 import {
-  createJobRegistry, DEFAULT_TIMEOUT_SECONDS, findWindowsCommand, MAX_RECENT_EVENTS,
-  MAX_STDERR_CHARS, MAX_TIMEOUT_SECONDS, terminateProcessTree, validateAbsoluteDir,
+  configuredFile, createJobRegistry, DEFAULT_TIMEOUT_SECONDS, findWindowsCommand, MAX_RECENT_EVENTS,
+  MAX_STDERR_CHARS, MAX_TIMEOUT_SECONDS, terminateProcessTree,
   windowsBatchInvocation,
 } from "./lib/process.mjs";
 
@@ -24,8 +25,8 @@ export function resolveAgyInvocation(agyArgs, env = process.env) {
     path.join(env.HOME || os.homedir(), ".local", "bin", "agy"),
     "/opt/homebrew/bin/agy", "/usr/local/bin/agy",
   ];
-  const found = [env.AGY_BIN, ...defaults].find(
-    (file) => file && fs.statSync(file, { throwIfNoEntry: false })?.isFile()
+  const found = configuredFile(env.AGY_BIN, "AGY_BIN") || defaults.find(
+    (file) => file && path.isAbsolute(file) && fs.statSync(file, { throwIfNoEntry: false })?.isFile()
   );
   const command = found ? path.resolve(found) : windows ? findWindowsCommand("agy", env) : "agy";
   if (windows && /\.(cmd|bat)$/i.test(command)) return windowsBatchInvocation(command, agyArgs);
@@ -41,19 +42,12 @@ const launchSchema = {
   properties: {
     prompt: { type: "string", description: "Task instructions for Antigravity." },
     cwd: { type: "string", description: "Absolute working directory." },
-    resume: {
-      type: "object",
-      properties: { conversation_id: { type: "string", minLength: 1 }, continue_last: { const: true } },
-      oneOf: [{ required: ["conversation_id"] }, { required: ["continue_last"] }],
-      additionalProperties: false,
-    },
     model: { type: "string" },
-    agent: { type: "string" },
     effort: { type: "string" },
-    mode: { type: "string", description: "Antigravity execution mode." },
+    mode: { enum: ["plan", "accept-edits"], default: "plan" },
     add_dirs: { type: "array", items: { type: "string" } },
-    sandbox: { type: "boolean", default: true },
-    disable_slash_commands: { type: "boolean", default: true },
+    sandbox: { const: true },
+    disable_slash_commands: { const: true },
     json_schema: { type: "object", description: "JSON Schema for the structured output." },
     timeout_seconds: { type: "integer", minimum: 1, maximum: MAX_TIMEOUT_SECONDS, default: DEFAULT_TIMEOUT_SECONDS },
   },
@@ -68,34 +62,26 @@ const jobTools = [
   { name: "antigravity_job_cancel", description: "Cancel a running Antigravity job and its child processes.", inputSchema: { ...jobSchema, required: ["job_id"] } },
 ];
 
-function buildArgs(params, seconds) {
+function buildArgs(params, seconds, policy) {
   const args = ["--input-format", "stream-json", "--output-format", "stream-json"];
   if (typeof params.prompt !== "string" || !params.prompt.trim()) throw new Error("A prompt is required.");
   if (!Number.isInteger(seconds) || seconds < 1 || seconds > MAX_TIMEOUT_SECONDS) {
     throw new Error("timeout_seconds must be an integer between 1 and " + MAX_TIMEOUT_SECONDS + ".");
   }
-  if (params.resume !== undefined) {
-    const resume = params.resume;
-    if (resume && Object.keys(resume).length === 1 && typeof resume.conversation_id === "string" && resume.conversation_id.trim()) {
-      args.push("--conversation", resume.conversation_id);
-    } else if (resume && Object.keys(resume).length === 1 && resume.continue_last === true) {
-      args.push("--continue");
-    } else {
-      throw new Error("resume requires either conversation_id or continue_last: true.");
-    }
-  }
-  for (const key of ["model", "agent", "effort", "mode"]) {
+  if (!policy.allowEdits) throw new Error("Antigravity requires AGENT_BRIDGE_ALLOW_EDITS=true because its CLI can edit the workspace.");
+  if (params.agent !== undefined || params.resume !== undefined) throw new Error("Custom agents and saved Antigravity conversations cannot be scoped to this launch.");
+  const mode = params.mode ?? "plan";
+  if (!["plan", "accept-edits"].includes(mode)) throw new Error("Choose plan or accept-edits.");
+  for (const key of ["model", "effort"]) {
     if (params[key] === undefined) continue;
-    if (typeof params[key] !== "string" || !params[key].trim()) throw new Error(key + " must be a non-empty string.");
+    if (typeof params[key] !== "string" || !params[key].trim() || /^\s*-/.test(params[key])) throw new Error("Invalid " + key + ".");
     args.push("--" + key, params[key]);
   }
-  if (params.add_dirs !== undefined) {
-    if (!Array.isArray(params.add_dirs)) throw new Error("add_dirs must be an array.");
-    for (const dir of params.add_dirs) args.push("--add-dir", validateAbsoluteDir(dir, "add_dirs"));
-  }
+  args.push("--mode", mode);
+  for (const dir of params.add_dirs) args.push("--add-dir", dir);
   for (const key of ["sandbox", "disable_slash_commands"]) {
-    if (params[key] !== undefined && typeof params[key] !== "boolean") throw new Error(key + " must be a boolean.");
-    if (params[key] !== false) args.push("--" + key.replaceAll("_", "-"));
+    if (params[key] !== undefined && params[key] !== true) throw new Error(key + " must be true.");
+    args.push("--" + key.replaceAll("_", "-"));
   }
   if (params.json_schema !== undefined) {
     if (!params.json_schema || typeof params.json_schema !== "object" || Array.isArray(params.json_schema)) {
@@ -140,12 +126,16 @@ function launch(registry, params, evaluation) {
   const seconds = params.timeout_seconds === undefined ? DEFAULT_TIMEOUT_SECONDS : params.timeout_seconds;
   let cwd, args;
   try {
-    cwd = validateAbsoluteDir(params.cwd);
-    args = buildArgs(params, seconds);
+    const policy = loadWorkspacePolicy();
+    cwd = resolveWorkspaceDir(policy, params.cwd);
+    if (params.add_dirs !== undefined && !Array.isArray(params.add_dirs)) throw new Error("add_dirs must be an array.");
+    params = { ...params, add_dirs: (params.add_dirs ?? []).map(dir => resolveWorkspaceDir(policy, dir, "add_dirs")) };
+    args = buildArgs(params, seconds, policy);
   } catch (err) {
     throw createRpcError(-32602, err.message);
   }
   const { env, nextDepth, nextChain } = buildChildBridgeEnv(direction, evaluation);
+  env.AGENT_BRIDGE_WORKSPACE_ROOTS = JSON.stringify([cwd, ...params.add_dirs]);
   const invocation = resolveAgyInvocation(args, env);
   const child = spawn(invocation.command, invocation.args, {
     cwd, env, shell: false, windowsVerbatimArguments: invocation.windowsVerbatimArguments,

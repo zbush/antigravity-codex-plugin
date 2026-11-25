@@ -3,24 +3,23 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { hasPlainPeerRegistration, resolveCodexInvocation, serverPath } from "./lib/codex-cli.mjs";
+export { resolveCodexInvocation };
+import { loadWorkspacePolicy, resolveWorkspaceDir } from "./lib/workspace-policy.mjs";
 
 import {
   DIRECTIONS,
   buildChildBridgeEnv,
   evaluateDelegationPolicy,
   getCodexEnvVarsOverrideArg,
-  hasCodexAntigravityMcpConfigured,
 } from "./lib/bridge.mjs";
 import { createRpcError, startMcpStdioServer } from "./lib/mcp.mjs";
 import {
   MAX_RECENT_EVENTS,
   MAX_STDERR_CHARS,
   clampTimeoutMs,
-  findWindowsCommand,
   createJobRegistry,
   terminateProcessTree,
-  validateAbsoluteDir,
-  windowsBatchInvocation,
 } from "./lib/process.mjs";
 
 const SERVER_NAME = "codex-local";
@@ -37,71 +36,20 @@ const LAUNCH_TOOL_NAMES = new Set([
 
 const registry = createJobRegistry();
 
-export function resolveCodexInvocation(codexArgs, env = process.env) {
-  const configuredBin = env.CODEX_BIN;
-  if (configuredBin && fs.existsSync(configuredBin)) {
-    if (process.platform === "win32" && /\.(cmd|bat)$/i.test(configuredBin)) {
-      return windowsBatchInvocation(configuredBin, codexArgs);
-    }
-    return {
-      command: configuredBin,
-      args: codexArgs,
-      shell: false,
-    };
-  }
-
-  const configuredJs = env.CODEX_CLI_JS;
-  if (configuredJs && fs.existsSync(configuredJs)) {
-    return {
-      command: process.execPath,
-      args: [configuredJs, ...codexArgs],
-      shell: false,
-    };
-  }
-
-  const nodeDir = path.dirname(process.execPath);
-  const npmPrefix = env.NPM_CONFIG_PREFIX || env.npm_config_prefix;
-  const candidateJsPaths = [
-    path.join(nodeDir, "node_modules", "@openai", "codex", "bin", "codex.js"),
-    path.resolve(nodeDir, "..", "lib", "node_modules", "@openai", "codex", "bin", "codex.js"),
-    ...(npmPrefix
-      ? [
-          path.join(npmPrefix, "node_modules", "@openai", "codex", "bin", "codex.js"),
-          path.join(npmPrefix, "lib", "node_modules", "@openai", "codex", "bin", "codex.js"),
-        ]
-      : []),
-    ...(process.platform === "win32" && env.APPDATA
-      ? [path.join(env.APPDATA, "npm", "node_modules", "@openai", "codex", "bin", "codex.js")]
-      : []),
-  ];
-
-  for (const candidate of candidateJsPaths) {
-    if (fs.existsSync(candidate)) {
-      return {
-        command: process.execPath,
-        args: [candidate, ...codexArgs],
-        shell: false,
-      };
-    }
-  }
-
-  if (process.platform === "win32") {
-    const command = findWindowsCommand("codex", env);
-    if (/\.(cmd|bat)$/i.test(command)) return windowsBatchInvocation(command, codexArgs);
-    return { command, args: codexArgs, shell: false };
-  }
-
-  return {
-    command: "codex",
-    args: codexArgs,
-    shell: false,
-  };
-}
-
 function buildCodexArgs(mode, params, lastMessagePath, includeAntigravityEnvVars) {
-  const args = ["exec"];
+  const args = ["--no-daemon", "-a", "never", "exec", "--ignore-user-config", "-s", params.sandbox];
+  const windowsBackend = process.env.AGENT_BRIDGE_CODEX_WINDOWS_SANDBOX;
+  if (process.platform === "win32" && windowsBackend !== undefined) {
+    if (!["mxc", "elevated", "unelevated"].includes(windowsBackend)) {
+      throw createRpcError(-32602, "Invalid AGENT_BRIDGE_CODEX_WINDOWS_SANDBOX.");
+    }
+    args.push("-c", "windows.sandbox=" + JSON.stringify(windowsBackend));
+  }
+  // Load only the installed paired server into the delegated CLI.
   const envVarsFlag = includeAntigravityEnvVars
-    ? ["-c", getCodexEnvVarsOverrideArg()]
+    ? ["-c", "mcp_servers.antigravity-local.command=" + JSON.stringify(process.execPath),
+       "-c", "mcp_servers.antigravity-local.args=" + JSON.stringify([serverPath]),
+       "-c", getCodexEnvVarsOverrideArg()]
     : [];
 
   if (mode === "run") {
@@ -110,19 +58,8 @@ function buildCodexArgs(mode, params, lastMessagePath, includeAntigravityEnvVars
     args.push("-C", params.cwd);
     args.push("-o", lastMessagePath);
 
-    const sandbox = params.sandbox || "workspace-write";
-    args.push("-s", sandbox);
-
     if (params.model) args.push("-m", String(params.model));
-    if (params.profile) args.push("-p", String(params.profile));
-    if (params.worktree) args.push("--worktree");
-    if (Array.isArray(params.add_dirs)) {
-      for (const dir of params.add_dirs) {
-        if (typeof dir === "string" && dir.trim()) {
-          args.push("--add-dir", validateAbsoluteDir(dir, "add_dirs"));
-        }
-      }
-    }
+    for (const dir of params.add_dirs) args.push("--add-dir", dir);
     if (params.skip_git_repo_check) args.push("--skip-git-repo-check");
     if (params.ephemeral) args.push("--ephemeral");
     args.push("-");
@@ -132,7 +69,6 @@ function buildCodexArgs(mode, params, lastMessagePath, includeAntigravityEnvVars
   if (mode === "resume") {
     args.push("resume", ...envVarsFlag, "--json", "-o", lastMessagePath);
     if (params.model) args.push("-m", String(params.model));
-    if (params.worktree) args.push("--worktree");
     if (params.skip_git_repo_check) args.push("--skip-git-repo-check");
     if (params.ephemeral) args.push("--ephemeral");
 
@@ -153,7 +89,6 @@ function buildCodexArgs(mode, params, lastMessagePath, includeAntigravityEnvVars
     }
     args.push("fork", ...envVarsFlag, "--json", "-o", lastMessagePath);
     if (params.model) args.push("-m", String(params.model));
-    if (params.worktree) args.push("--worktree");
     if (params.skip_git_repo_check) args.push("--skip-git-repo-check");
     if (params.ephemeral) args.push("--ephemeral");
     args.push(String(params.session_id), "-");
@@ -242,7 +177,36 @@ function assertLaunchAllowed() {
 }
 
 function createRunner(mode, rawParams, evaluation) {
-  const cwd = validateAbsoluteDir(rawParams.cwd, "cwd");
+  const policy = loadWorkspacePolicy();
+  let cwd, params;
+  try {
+    cwd = resolveWorkspaceDir(policy, rawParams.cwd);
+    const sandbox = rawParams.sandbox ?? "read-only";
+    if (sandbox !== "read-only" && !(sandbox === "workspace-write" && policy.allowEdits)) {
+      throw new Error("Use read-only, or enable AGENT_BRIDGE_ALLOW_EDITS=true for workspace-write.");
+    }
+    if (rawParams.profile !== undefined || rawParams.worktree) throw new Error("Profiles and managed worktrees are outside the launch policy.");
+    for (const key of ["model", "session_id", "base", "commit", "title"]) {
+      const value = rawParams[key];
+      if (value !== undefined && (typeof value !== "string" || !value.trim() || /^\s*-/.test(value))) throw new Error("Invalid " + key + ".");
+    }
+    if (rawParams.add_dirs !== undefined && (!Array.isArray(rawParams.add_dirs) || mode !== "run")) {
+      throw new Error("add_dirs must be an array on a fresh run.");
+    }
+    const add_dirs = (rawParams.add_dirs ?? []).map(dir => resolveWorkspaceDir(policy, dir, "add_dirs"));
+    params = { ...rawParams, cwd, add_dirs, sandbox };
+    if (mode === "resume" || mode === "fork") {
+      if (params.last && (mode !== "resume" || params.session_id)) throw new Error("Choose a single resume target.");
+      const prior = [...registry.jobs.values()].reverse().find(job => job.cwd === cwd && job.status === "completed" &&
+        !job.ephemeral && job.session_id && (params.session_id === job.session_id || params.last === true));
+      if (!prior) throw new Error("Choose a completed session started by this bridge in the same workspace.");
+      if (prior.additionalRoots.length || (prior.sandbox === "workspace-write" && sandbox === "read-only")) {
+        throw new Error("The saved session had broader permissions. Start a fresh run with this scope.");
+      }
+      params.session_id = prior.session_id;
+      params.last = false;
+    }
+  } catch (error) { throw createRpcError(-32602, error.message); }
   if ((mode === "run" || mode === "resume" || mode === "fork") && !String(rawParams.prompt || "").trim()) {
     throw new Error(`'prompt' is required for mode '${mode}'.`);
   }
@@ -252,15 +216,21 @@ function createRunner(mode, rawParams, evaluation) {
     os.tmpdir(),
     `codex-mcp-last-${jobId}-${Date.now()}.txt`
   );
-  const params = { ...rawParams, cwd };
-  const includeEnvVars = hasCodexAntigravityMcpConfigured();
+  const canReturn = evaluation.config.directions[DIRECTIONS.CODEX_TO_ANTIGRAVITY] &&
+    evaluation.context.depth + 1 < evaluation.config.max_depth && (evaluation.context.envelope?.remaining_hops ?? Infinity) > 1;
+  const includeEnvVars = canReturn && hasPlainPeerRegistration();
   const { args, stdinPrompt } = buildCodexArgs(mode, params, lastMessagePath, includeEnvVars);
   const invocation = resolveCodexInvocation(args);
   const timeoutMs = clampTimeoutMs(params.timeout_seconds);
   const { env: childEnv, nextDepth, nextChain } = buildChildBridgeEnv(DIRECTION, evaluation);
+  childEnv.AGENT_BRIDGE_WORKSPACE_ROOTS = JSON.stringify([cwd, ...params.add_dirs]);
+  childEnv.AGENT_BRIDGE_ALLOW_EDITS = String(params.sandbox === "workspace-write");
 
   const state = {
     job_id: jobId,
+    ephemeral: Boolean(params.ephemeral),
+    sandbox: params.sandbox,
+    additionalRoots: params.add_dirs.filter(dir => dir !== cwd),
     mode,
     cwd,
     status: "running",
@@ -534,22 +504,13 @@ const ALL_TOOLS = [
         },
         sandbox: {
           type: "string",
-          enum: ["read-only", "workspace-write", "danger-full-access"],
+          enum: ["read-only", "workspace-write"],
           description:
-            "Sandbox policy for Codex commands. Default: 'workspace-write'. Use 'read-only' for audits and analysis.",
+            "Defaults to read-only. workspace-write requires AGENT_BRIDGE_ALLOW_EDITS=true.",
         },
         model: {
           type: "string",
-          description: "Optional model override (defaults to user's ~/.codex/config.toml).",
-        },
-        profile: {
-          type: "string",
-          description: "Optional Codex configuration profile name.",
-        },
-        worktree: {
-          type: "boolean",
-          description:
-            "Run Codex in a new managed Git worktree to isolate edits from the main working tree.",
+          description: "Optional model for the delegated CLI.",
         },
         add_dirs: {
           type: "array",
@@ -599,10 +560,6 @@ const ALL_TOOLS = [
           type: "string",
           description: "Optional model override.",
         },
-        worktree: {
-          type: "boolean",
-          description: "Run in a managed Git worktree.",
-        },
         skip_git_repo_check: {
           type: "boolean",
           description: "Allow running outside a Git repository.",
@@ -637,10 +594,6 @@ const ALL_TOOLS = [
         model: {
           type: "string",
           description: "Optional model override.",
-        },
-        worktree: {
-          type: "boolean",
-          description: "Run the forked session in a new managed Git worktree.",
         },
         skip_git_repo_check: {
           type: "boolean",
@@ -727,15 +680,10 @@ const ALL_TOOLS = [
         },
         sandbox: {
           type: "string",
-          enum: ["read-only", "workspace-write", "danger-full-access"],
-          description: "Sandbox policy when mode is 'run'. Default: 'workspace-write'.",
+          enum: ["read-only", "workspace-write"],
+          description: "Defaults to read-only. workspace-write requires operator permission.",
         },
         model: { type: "string", description: "Optional model override." },
-        profile: { type: "string", description: "Optional Codex profile." },
-        worktree: {
-          type: "boolean",
-          description: "Recommended when spawning multiple parallel editing Codex agents in the same repo.",
-        },
         add_dirs: { type: "array", items: { type: "string" } },
         uncommitted: { type: "boolean" },
         base: { type: "string" },

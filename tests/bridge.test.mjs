@@ -47,7 +47,7 @@ async function mockAgy() {
     structured_output: {
       message, args: process.argv.slice(2), cwd: process.cwd(),
       depth: process.env.AGENT_BRIDGE_DEPTH, chain: process.env.AGENT_BRIDGE_CHAIN,
-      maxDepth: process.env.AGENT_BRIDGE_MAX_DEPTH,
+      maxDepth: JSON.parse(process.env.AGENT_BRIDGE_INHERITED_POLICY ?? "{}").max_depth,
     },
   };
   if (prompt === "cli error") result.error = "model error";
@@ -58,12 +58,13 @@ async function mockAgy() {
 }
 
 async function mockCodex() {
-  if (process.argv[2] !== "exec") throw new Error("Expected codex exec");
+  if (!process.argv.includes("exec")) throw new Error("Expected codex exec");
   let prompt = "";
   for await (const chunk of process.stdin) prompt += chunk;
   const context = {
     depth: process.env.AGENT_BRIDGE_DEPTH, chain: process.env.AGENT_BRIDGE_CHAIN,
-    maxDepth: process.env.AGENT_BRIDGE_MAX_DEPTH, prompt,
+    maxDepth: JSON.parse(process.env.AGENT_BRIDGE_INHERITED_POLICY).max_depth, prompt,
+    args: process.argv.slice(2), allowEdits: process.env.AGENT_BRIDGE_ALLOW_EDITS,
   };
   console.log(JSON.stringify({ type: "thread.started", thread_id: "codex-id" }));
   console.log(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify(context) } }));
@@ -82,6 +83,7 @@ function fixture(t) {
   }
   Object.assign(env, {
     CODEX_HOME: codexHome, AGENT_BRIDGE_CONFIG: file,
+    AGENT_BRIDGE_WORKSPACE_ROOTS: JSON.stringify([dir]), AGENT_BRIDGE_ALLOW_EDITS: "true",
     AGY_BIN: path.join(dir, "mock agy.cjs"), CODEX_CLI_JS: path.join(dir, "mock codex.cjs"),
   });
   fs.writeFileSync(env.AGY_BIN, "(" + mockAgy.toString() + ")();");
@@ -192,7 +194,8 @@ test("invalid policies and malformed delegation contexts fail closed", (t) => {
 
 test("depth, repeated hops, and child environment propagation", (t) => {
   const { env, file } = fixture(t);
-  const base = { ...env, AGENT_BRIDGE_DEPTH: "2", AGENT_BRIDGE_CHAIN: JSON.stringify([reverse, forward]) };
+  const base = { ...env, AGENT_BRIDGE_DEPTH: "2", AGENT_BRIDGE_CHAIN: JSON.stringify([reverse, forward]),
+    AGENT_BRIDGE_INHERITED_POLICY: JSON.stringify({ ...policy, allow_cycles: true }) };
   assert.deepEqual(readDelegationContext({}), { depth: 0, chain: [] });
   assert.equal(evaluateDelegationPolicy(reverse, base).reason, "cycle_blocked");
   assert.equal(evaluateDelegationPolicy(reverse, { ...base, AGENT_BRIDGE_MAX_DEPTH: "2" }).reason, "max_depth_reached");
@@ -201,18 +204,56 @@ test("depth, repeated hops, and child environment propagation", (t) => {
   const child = buildChildBridgeEnv(reverse, evaluation, { ...base, PRESERVED: "yes" });
   assert.deepEqual(child.nextChain, [reverse, forward, reverse]);
   assert.equal(child.nextDepth, 3);
-  assert.deepEqual(readDelegationContext(child.env), { depth: 3, chain: child.nextChain });
-  assert.deepEqual([
-    child.env.AGENT_BRIDGE_MAX_DEPTH, child.env.AGENT_BRIDGE_ANTIGRAVITY_TO_CODEX,
-    child.env.AGENT_BRIDGE_CODEX_TO_ANTIGRAVITY, child.env.AGENT_BRIDGE_ALLOW_CYCLES,
-    child.env.AGENT_BRIDGE_CONFIG, child.env.PRESERVED, base.AGENT_BRIDGE_DEPTH,
-  ], ["4", "true", "true", "true", file, "yes", "2"]);
+  const parsed = readDelegationContext(child.env);
+  assert.equal(parsed.depth, 3);
+  assert.deepEqual(parsed.chain, child.nextChain);
+  assert.equal(parsed.envelope.remaining_hops, evaluation.config.max_depth - 3);
+  assert.deepEqual(JSON.parse(child.env.AGENT_BRIDGE_INHERITED_POLICY), evaluation.config);
+  assert.deepEqual([child.env.AGENT_BRIDGE_CONFIG, child.env.PRESERVED, base.AGENT_BRIDGE_DEPTH], [file, "yes", "2"]);
+});
+
+test("nested servers honor revocation and cannot gain authority from a looser policy file", t => {
+  const { env, file } = fixture(t);
+  writeJson(file, { ...policy, max_depth: 2 });
+  const child = buildChildBridgeEnv(forward, evaluateDelegationPolicy(forward, env), env).env;
+  assert.equal(evaluateDelegationPolicy(reverse, child).allowed, true);
+  writeJson(file, { ...policy, directions: { [forward]: true, [reverse]: false } });
+  assert.equal(evaluateDelegationPolicy(reverse, child).reason, "direction_disabled");
+  writeJson(file, { ...policy, max_depth: 8, allow_cycles: true });
+  const after = evaluateDelegationPolicy(reverse, child);
+  assert.equal(after.config.max_depth, 2);
+  assert.equal(after.config.allow_cycles, false);
+  assert.equal(evaluateDelegationPolicy(reverse, { ...child, AGENT_BRIDGE_INHERITED_POLICY: "{}" }).reason, "invalid_config");
+});
+
+test("a foreign handoff spends the shared budget and keeps this pair's first-return rule", t => {
+  const { env } = fixture(t);
+  const incoming = { version: 1, hops: [{ from: "claude", to: "antigravity", id: "receipt" }], remaining_hops: 2 };
+  const foreign = { ...env, AGENT_BRIDGE_CONTEXT: JSON.stringify(incoming) };
+  const first = evaluateDelegationPolicy(forward, foreign);
+  assert.equal(first.allowed, true);
+  const child = buildChildBridgeEnv(forward, first, foreign).env;
+  const second = evaluateDelegationPolicy(reverse, child);
+  assert.equal(second.allowed, true);
+  const leaf = buildChildBridgeEnv(reverse, second, child).env;
+  const outgoing = JSON.parse(leaf.AGENT_BRIDGE_CONTEXT);
+  assert.deepEqual(outgoing.hops[0], incoming.hops[0]);
+  assert.equal(outgoing.remaining_hops, 0);
+  assert.equal(evaluateDelegationPolicy(forward, leaf).reason, "max_depth_reached");
+  assert.equal(evaluateDelegationPolicy(reverse, foreign).reason, "invalid_context");
+  assert.equal(evaluateDelegationPolicy(forward, { ...foreign, AGENT_BRIDGE_CONTEXT: "{}" }).reason, "invalid_context");
 });
 
 for (const [name, direction, incoming] of [["codex", forward, reverse], ["antigravity", reverse, forward]]) {
   test(name + " stdio initialization, delegation, and live policy enforcement", async (t) => {
     const f = fixture(t);
-    const client = f.connect(name, { AGENT_BRIDGE_DEPTH: "1", AGENT_BRIDGE_CHAIN: JSON.stringify([incoming]) });
+    const nested = { AGENT_BRIDGE_DEPTH: "1", AGENT_BRIDGE_CHAIN: JSON.stringify([incoming]) };
+    const legacy = f.connect(name, nested);
+    assert.ok(!(await legacy.tools()).includes(name + "_run"));
+    const denied = await legacy.call(name + "_run", { cwd: f.dir, prompt: "fixture" });
+    assertDenied(denied, "invalid_config");
+    assert.match(denied.error.message, /configure\.mjs --wire-codex/);
+    const client = f.connect(name, { ...nested, AGENT_BRIDGE_INHERITED_POLICY: JSON.stringify(policy) });
     const init = (await client.request("initialize", { protocolVersion: "2024-11-05" })).result;
     assert.deepEqual(init.serverInfo, { name: name + "-local", version: "2.0.0" });
     assert.equal(init.capabilities.tools.listChanged, true);
@@ -230,15 +271,15 @@ for (const [name, direction, incoming] of [["codex", forward, reverse], ["antigr
     const context = name === "codex" ? JSON.parse(job.response) : job.structured_output;
     assert.equal(context.depth, "2");
     assert.deepEqual(JSON.parse(context.chain), expectedChain);
-    assert.equal(context.maxDepth, "4");
+    assert.equal(context.maxDepth, 4);
     if (name === "codex") {
       assert.equal(context.prompt, args.prompt);
       assert.equal(job.session_id, "codex-id");
     } else {
       assert.deepEqual(context.message, { event: "user", message: { content: args.prompt } });
       assert.deepEqual(context.args, ["--input-format", "stream-json", "--output-format", "stream-json",
-        "--sandbox", "--disable-slash-commands", "--print-timeout", "600s"]);
-      assert.equal(context.cwd, f.dir);
+        "--mode", "plan", "--sandbox", "--disable-slash-commands", "--print-timeout", "600s"]);
+      assert.equal(context.cwd, fs.realpathSync.native(f.dir));
     }
     writeJson(f.file, { ...policy, max_depth: 1 });
     assert.deepEqual(await client.tools(), inspect);
@@ -253,26 +294,63 @@ for (const [name, direction, incoming] of [["codex", forward, reverse], ["antigr
   });
 }
 
+test("launches enforce operator roots, edit permissions and bounded session reuse", async t => {
+  const f = fixture(t);
+  const safe = f.connect("codex", { AGENT_BRIDGE_ALLOW_EDITS: "false" });
+  const args = { cwd: f.dir, prompt: "test" };
+  const deny = async (client, tool, values) => assert.equal((await client.call(tool, values)).error.code, -32602);
+  for (const override of [{ sandbox: "workspace-write" }, { sandbox: "danger-full-access" }, { worktree: true },
+    { profile: "extra" }, { cwd: path.dirname(f.dir) }, { add_dirs: [path.dirname(f.dir)] }]) {
+    await deny(safe, "codex_run", { ...args, ...override });
+  }
+  await deny(safe, "codex_fork", { ...args, session_id: "unknown" });
+  const verify = (job, sandbox) => {
+    const record = JSON.parse(job.response);
+    assert.equal(record.args[record.args.indexOf("-s") + 1], sandbox);
+    assert.equal(record.args[record.args.indexOf("-a") + 1], "never");
+    assert.ok(record.args.includes("--ignore-user-config"));
+    assert.equal(record.allowEdits, String(sandbox === "workspace-write"));
+  };
+  const run = payload(await safe.call("codex_run", args));
+  verify(run, "read-only");
+  verify(payload(await safe.call("codex_resume", { ...args, session_id: run.session_id })), "read-only");
+  verify(payload(await safe.call("codex_review", args)), "read-only");
+  const editing = f.connect("codex");
+  verify(payload(await editing.call("codex_run", { ...args, sandbox: "workspace-write" })), "workspace-write");
+  await deny(f.connect("antigravity", { AGENT_BRIDGE_ALLOW_EDITS: "false" }), "antigravity_spawn", args);
+});
+
+test("Windows delegates receive only an operator-selected sandbox backend", { skip: process.platform !== "win32" }, async t => {
+  const f = fixture(t);
+  const args = { cwd: f.dir, prompt: "test" };
+  const selected = f.connect("codex", { AGENT_BRIDGE_CODEX_WINDOWS_SANDBOX: "elevated" });
+  const record = JSON.parse(payload(await selected.call("codex_run", args)).response);
+  assert.ok(record.args.includes('windows.sandbox="elevated"'));
+  const invalid = f.connect("codex", { AGENT_BRIDGE_CODEX_WINDOWS_SANDBOX: "unknown" });
+  const denied = await invalid.call("codex_run", args);
+  assert.match(denied.error.message, /Invalid AGENT_BRIDGE_CODEX_WINDOWS_SANDBOX/);
+});
+
 test("Antigravity maps launch flags and requires a successful terminal result and exit", async (t) => {
   const f = fixture(t);
   const client = f.connect("antigravity");
   const call = (params) => client.call("antigravity_run", { cwd: f.dir, prompt: "test", ...params });
   const schema = { type: "object", description: 'some "text" & a %VARIABLE%' };
   const result = payload(await call({
-    resume: { conversation_id: "old-id" }, model: "test model", effort: "high", agent: "local", mode: "fast",
-    sandbox: false, disable_slash_commands: false, add_dirs: [f.dir, f.codexHome], json_schema: schema, timeout_seconds: 25,
+    model: "test model", effort: "high", mode: "accept-edits",
+    add_dirs: [f.dir, f.codexHome], json_schema: schema, timeout_seconds: 25,
   }));
   assert.deepEqual(result.structured_output.args, [
-    "--input-format", "stream-json", "--output-format", "stream-json", "--conversation", "old-id", "--model", "test model",
-    "--agent", "local", "--effort", "high", "--mode", "fast", "--add-dir", f.dir, "--add-dir", f.codexHome,
+    "--input-format", "stream-json", "--output-format", "stream-json", "--model", "test model",
+    "--effort", "high", "--mode", "accept-edits", "--add-dir", fs.realpathSync.native(f.dir), "--add-dir", fs.realpathSync.native(f.codexHome),
+    "--sandbox", "--disable-slash-commands",
     "--json-schema", JSON.stringify(schema), "--print-timeout", "25s",
   ]);
   assert.equal(result.conversation_id, "agy-id");
   assert.equal(result.response, "final answer");
   assert.deepEqual(result.usage, { total_tokens: 12 });
   assert.deepEqual(result.recent_events.map((e) => e.event), ["init", "step_update", "step_update", "result"]);
-  assert.ok(payload(await call({ resume: { continue_last: true } })).structured_output.args.includes("--continue"));
-  for (const params of [{ resume: {} }, { resume: { conversation_id: "id", continue_last: true } },
+  for (const params of [{ resume: {} }, { resume: { continue_last: true } }, { agent: "override" }, { sandbox: false }, { disable_slash_commands: false },
     { add_dirs: ["relative"] }, { sandbox: "false" }, { timeout_seconds: -2 }, { json_schema: [] }]) {
     assert.equal((await call(params)).error.code, -32602);
   }
@@ -322,7 +400,9 @@ test("AGY_BIN and platform installation defaults take precedence over PATH", (t)
   assert.deepEqual(resolveAgyInvocation(["flag"], f.env), {
     command: process.execPath, args: [f.env.AGY_BIN, "flag"], shell: false,
   });
-  const env = { AGY_BIN: path.join(f.dir, "missing"), PATH: f.dir, HOME: f.dir, USERPROFILE: f.dir, LOCALAPPDATA: f.dir };
+  const env = { PATH: f.dir, HOME: f.dir, USERPROFILE: f.dir, LOCALAPPDATA: f.dir };
+  assert.throws(() => resolveAgyInvocation([], { ...env, AGY_BIN: path.join(f.dir, "missing") }), /AGY_BIN/);
+  if (process.platform === "win32") assert.throws(() => resolveAgyInvocation([], env), /absolute executable path/);
   const windows = process.platform === "win32";
   const local = path.join(f.dir, ".local", "bin", windows ? "agy.exe" : "agy");
   fs.mkdirSync(path.dirname(local), { recursive: true });
@@ -338,7 +418,7 @@ test("AGY_BIN and platform installation defaults take precedence over PATH", (t)
     const cmd = path.join(f.dir, "agy.cmd"), exe = path.join(f.dir, "agy.exe");
     fs.writeFileSync(cmd, '@echo off\r\n"' + process.execPath + '" "%~dp0mock agy.cjs" %*\r\n');
     fs.writeFileSync(exe, "");
-    assert.equal(resolveAgyInvocation([], env).command, exe);
+    assert.equal(resolveAgyInvocation([], { ...env, PATH: '"' + f.dir + '"' }).command, exe);
     fs.unlinkSync(exe);
     const args = ["--json-schema", JSON.stringify({ description: 'quoted "text" & literal %AGY_BIN% (!)' })];
     const invocation = resolveAgyInvocation(args, env);
@@ -350,6 +430,19 @@ test("AGY_BIN and platform installation defaults take precedence over PATH", (t)
     assert.equal(run.status, 0, run.stderr);
     const result = JSON.parse(run.stdout.trim().split("\n").pop()).result;
     assert.deepEqual(result.structured_output.args, args);
+    const systemRoot = process.env.SystemRoot, windir = process.env.WINDIR;
+    try {
+      process.env.SystemRoot = "relative";
+      process.env.WINDIR = f.dir;
+      assert.equal(resolveAgyInvocation([], env).command, path.join(f.dir, "System32", "cmd.exe"));
+      delete process.env.WINDIR;
+      assert.throws(() => resolveAgyInvocation([], env), /fully qualified SystemRoot or WINDIR/);
+    } finally {
+      if (systemRoot === undefined) delete process.env.SystemRoot;
+      else process.env.SystemRoot = systemRoot;
+      if (windir === undefined) delete process.env.WINDIR;
+      else process.env.WINDIR = windir;
+    }
   }
 });
 
@@ -403,6 +496,38 @@ function configurator(f) {
     return run.stdout + run.stderr;
   };
 }
+
+test("isolated Codex runs reconstruct only the enabled standard peer registration", async t => {
+  const f = fixture(t);
+  const cfg = configurator(f);
+  cfg(["--wire-codex"]);
+  fs.writeFileSync(f.env.CODEX_CLI_JS, "process.argv[2] === 'mcp' ? (" + mockRegistration.toString() + ")() : (" + mockCodex.toString() + ")();");
+  const client = f.connect("codex");
+  const peerIsPresent = async () => {
+    const job = payload(await client.call("codex_run", { cwd: f.dir, prompt: "fixture" }));
+    return JSON.parse(job.response).args.some(arg => arg.startsWith("mcp_servers.antigravity-local.command="));
+  };
+  assert.equal(await peerIsPresent(), true);
+  const meta = path.join(f.codexHome, "registration.json");
+  const info = readJson(meta);
+  writeJson(meta, { ...info, enabled: false });
+  assert.equal(await peerIsPresent(), false);
+  writeJson(meta, { ...info, transport: { ...info.transport, args: ["some-other-server"] } });
+  assert.equal(await peerIsPresent(), false);
+  writeJson(meta, info);
+  fs.appendFileSync(path.join(f.codexHome, "config.toml"), "\n[mcp_servers.antigravity-local.tools.antigravity_spawn]\napproval_mode = 'ask'\n");
+  assert.equal(await peerIsPresent(), false);
+});
+
+test("configurator edits the runtime environment-selected file", t => {
+  const f = fixture(t);
+  const run = spawnSync(process.execPath, [path.join(root, "scripts/configure.mjs"), "--max-depth", "2"], {
+    env: { ...f.env, HOME: f.dir, USERPROFILE: f.dir }, encoding: "utf8",
+  });
+  assert.equal(run.status, 0, run.stderr);
+  assert.equal(readJson(f.file).max_depth, 2);
+  assert.equal(fs.existsSync(path.join(f.dir, ".gemini")), false);
+});
 
 test("configurator applies presets then overrides, replaces atomically and reports effective status", (t) => {
   const f = fixture(t), cli = configurator(f);

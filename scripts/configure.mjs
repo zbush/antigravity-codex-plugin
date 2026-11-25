@@ -1,15 +1,11 @@
 #!/usr/bin/env node
-import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { resolveCodexInvocation } from "../server/codex-mcp.mjs";
-import { BRIDGE_ENV_VARS, getDefaultUserConfigPath, loadBridgeConfig } from "../server/lib/bridge.mjs";
+import { codex, matches, peerTable, registration, serverName, serverPath, statements } from "../server/lib/codex-cli.mjs";
+import { BRIDGE_ENV_VARS, resolvePolicyPath, loadBridgeConfig } from "../server/lib/bridge.mjs";
 
-const serverName = "antigravity-local";
-const serverPath = fileURLToPath(new URL("../server/antigravity-mcp.mjs", import.meta.url));
 const modes = {
   "agy-master": [true, false, 1],
   "codex-master": [false, true, 1],
@@ -112,76 +108,9 @@ function configurePolicy(file, opts) {
     const env = { ...process.env };
     if (opts.config) delete env.AGENT_BRIDGE_CONFIG;
     const { config, userConfigPath } = loadBridgeConfig(env, file);
+    if (env.AGENT_BRIDGE_INHERITED_POLICY) console.log("The inherited delegation ceiling applies to this status.");
     console.log("Effective policy (" + userConfigPath + "): " + JSON.stringify(config, null, 2));
   }
-}
-
-function codex(args, allowMissing = false) {
-  const invocation = resolveCodexInvocation(["mcp", ...args]);
-  const run = spawnSync(invocation.command, invocation.args, {
-    windowsVerbatimArguments: invocation.windowsVerbatimArguments, windowsHide: true,
-    encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 30000,
-  });
-  if (run.error) throw run.error;
-  if (run.status === 0) return run.stdout;
-  const detail = (run.stderr || run.stdout || "CLI exited with " + (run.signal ?? run.status)).trim();
-  if (allowMissing && /^ *(?:Error: )?No MCP server named ['"]antigravity-local['"] found\.?\s*$/im.test(detail)) {
-    return null;
-  }
-  throw new Error(detail);
-}
-
-function registration() {
-  const json = codex(["get", "--json", serverName], true);
-  if (json === null) return null;
-  const info = JSON.parse(json);
-  if (!info?.transport) throw new Error("Unexpected response to codex mcp get.");
-  return info;
-}
-
-function sameFile(a, b) {
-  if (typeof a !== "string" || !path.isAbsolute(a)) return false;
-  if (path.relative(a, b) === "") return true;
-  return fs.existsSync(a) && fs.existsSync(b) && path.relative(fs.realpathSync(a), fs.realpathSync(b)) === "";
-}
-
-function matches(info) {
-  const { type, command, args } = info.transport;
-  const node = sameFile(command, process.execPath) || command === "node" ||
-    (process.platform === "win32" && command?.toLowerCase() === "node.exe");
-  return type === "stdio" && node && args?.length === 1 && sameFile(args[0], serverPath);
-}
-
-// Walk complete TOML statements. Skip quoted text and comments so examples
-// embedded in multiline strings and arrays cannot masquerade as table headers.
-function* statements(source) {
-  const tokens = /"""|'''|"(?:\\.|[^"\\\r\n])*"|'[^'\r\n]*'|#[^\r\n]*|[\[\]{}\n]/g;
-  let start = 0, nesting = 0;
-  for (let i = 0; i < source.length;) {
-    tokens.lastIndex = i;
-    const match = tokens.exec(source);
-    if (!match) break;
-    const at = match.index;
-    i = tokens.lastIndex;
-    // Triple-quoted TOML strings can span newlines and end in 3–5 quotes.
-    const triple = match[0];
-    if (triple === '"""' || triple === "'''") {
-      const end = triple === '"""' ? /\\[\s\S]|"{3,5}/g : /'{3,5}/g;
-      end.lastIndex = at + 3;
-      let close;
-      do { close = end.exec(source); } while (close && close[0][0] === "\\");
-      if (!close) throw new Error("Unterminated TOML string. Check config.toml.");
-      i = end.lastIndex;
-      continue;
-    }
-    if (match[0] === "[" || match[0] === "{") nesting++;
-    if (match[0] === "]" || match[0] === "}") nesting--;
-    if (match[0] === "\n" && nesting === 0) {
-      yield { start, end: i, text: source.slice(start, i) };
-      start = i;
-    }
-  }
-  if (start < source.length) yield { start, end: source.length, text: source.slice(start) };
 }
 
 function ensureEnvVars(info) {
@@ -189,13 +118,12 @@ function ensureEnvVars(info) {
   if (!missing.length) return;
   const file = path.join(process.env.CODEX_HOME || path.join(os.homedir(), ".codex"), "config.toml");
   const source = fs.readFileSync(file, "utf8");
-  const header = /^\s*\[\s*(?:mcp_servers|"mcp_servers"|'mcp_servers')\s*\.\s*(?:antigravity-local|"antigravity-local"|'antigravity-local')\s*\]\s*(?:#.*)?\s*$/;
   const key = /^\s*(?:env_vars|"env_vars"|'env_vars')\s*=\s*\[/;
   let table, arrayStart;
   for (const statement of statements(source)) {
     if (statement.text.trimStart().startsWith("[")) {
       if (table) break;
-      if (header.test(statement.text)) table = statement;
+      if (peerTable.test(statement.text)) table = statement;
     } else if (table) {
       const prefix = statement.text.match(key);
       if (prefix) arrayStart = statement.start + prefix[0].length;
@@ -249,7 +177,7 @@ function configureRegistration(opts) {
 function main() {
   const opts = parseOptions(process.argv.slice(2));
   if (opts.help || process.argv.length === 2) return console.log(usage);
-  const file = opts.config || getDefaultUserConfigPath();
+  const file = resolvePolicyPath(opts.config ?? process.env.AGENT_BRIDGE_CONFIG);
   try { configurePolicy(file, opts); } catch (err) {
     console.error("Bridge config error (" + file + "): " + err.message);
     process.exitCode = 1;
