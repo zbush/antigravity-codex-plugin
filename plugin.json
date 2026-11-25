@@ -1,7 +1,7 @@
 {
   "name": "codex",
-  "displayName": "Local Codex Orchestrator",
-  "version": "1.0.0",
+  "displayName": "Antigravity <-> Codex Bridge",
+  "version": "2.0.0",
   "logo": "assets/logo.png",
   "author": {
     "name": "zbush",
@@ -12,7 +12,7 @@
     "type": "git",
     "url": "https://github.com/zbush/antigravity-codex-plugin"
   },
-  "description": "Orchestrate local OpenAI Codex CLI agents via a bundled zero-dependency MCP server: run tasks, resume or fork sessions, perform code reviews, and manage parallel background Codex workers.",
+  "description": "Bidirectional zero-dependency MCP bridge between Google Antigravity and OpenAI Codex CLI with independently toggleable directions, hierarchy presets, and loop protection.",
   "suggestedPrompts": [
     "Ask local Codex to review my uncommitted git changes",
     "Delegate a scoped implementation task to a local Codex agent in a git worktree",

@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "directions": {
+    "antigravity_to_codex": true,
+    "codex_to_antigravity": false
+  },
+  "max_depth": 1,
+  "allow_cycles": false
+}
